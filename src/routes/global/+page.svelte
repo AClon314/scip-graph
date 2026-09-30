@@ -9,6 +9,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type { SgGraph } from '$lib/graph/schema';
+	import OutlineTree from '$lib/components/OutlineTree.svelte';
 	import {
 		aggregate,
 		LEVELS,
@@ -62,7 +63,7 @@
 	};
 
 	// --- non-reactive scene state (canvas render loop) -----------------------
-	let graph: SgGraph | null = null;
+	let graph = $state.raw<SgGraph | null>(null);
 	let agg: Aggregation | null = null;
 	let nodeById = new Map<string, AggNode>();
 	let selection = new Set<string>();
@@ -74,6 +75,13 @@
 	let layoutToken = 0;
 	let drag: DragState | null = null;
 	let lastTooltipKey = '';
+	/** 0..1 pulse used while a selection is elevated before navigating. */
+	let elevate = 0;
+	let navigating = false;
+	/** Graph-wide symbol lookup so the Local handoff works at any level. */
+	let allSymbolIds = new Set<string>();
+	let symbolsByFile = new Map<string, string[]>();
+	let symbolsByDir = new Map<string, string[]>();
 
 	let canvasEl: HTMLCanvasElement | undefined = $state();
 	let ctx: CanvasRenderingContext2D | null = null;
@@ -95,6 +103,10 @@
 	let selBox = $state<Box | null>(null);
 	let panning = $state(false);
 	let selecting = $state(false);
+	let outlineCollapsed = $state(false);
+	let helpOpen = $state(false);
+	/** Reactive mirror of the canvas selection for the outline sidebar. */
+	let selectedKeys = $state<string[]>([]);
 
 	// -------------------------------------------------------------------------
 	// helpers
@@ -163,6 +175,7 @@
 
 	function updateSelectionUi() {
 		selectionCount = selection.size;
+		selectedKeys = [...selection];
 	}
 
 	async function relayout(): Promise<GlobalMetrics | undefined> {
@@ -310,6 +323,23 @@
 			const hovered = hoverId === node.id;
 			const dim = !!searchQuery && !searchMatches?.has(node.id);
 			ctx.globalAlpha = dim ? 0.12 : 1;
+			if (selected && elevate > 0) {
+				const pad = 2 + elevate * 10;
+				ctx.save();
+				ctx.globalAlpha = 0.15 + 0.35 * elevate;
+				ctx.strokeStyle = '#ffd54a';
+				ctx.lineWidth = 2 + 3 * elevate;
+				ctx.shadowColor = '#ffd54a';
+				ctx.shadowBlur = 16 * elevate;
+				if (w < 26 || h < 8) {
+					ctx.strokeRect(rx - pad, ry - pad, w + pad * 2, h + pad * 2);
+				} else {
+					ctx.beginPath();
+					ctx.roundRect(rx - pad, ry - pad, w + pad * 2, h + pad * 2, 6);
+					ctx.stroke();
+				}
+				ctx.restore();
+			}
 			ctx.fillStyle = nodeFill(node, selected ? 0.95 : 0.82);
 			if (w < 26 || h < 8) {
 				ctx.fillRect(rx, ry, w, h);
@@ -357,11 +387,349 @@
 		return [...selection];
 	}
 
-	function jumpToLocal() {
-		const ids = [...selection];
-		if (!ids.length) return;
-		localStorage.setItem(HANDOFF_KEY, JSON.stringify({ ids, ts: Date.now() }));
-		goto('/local?ids=' + ids.join(','));
+	// --- focus / centering ---------------------------------------------------
+	function centerOn(id: string, zoom?: number): boolean {
+		const node = nodeById.get(id);
+		if (!node || !canvasEl) return false;
+		const cw = canvasEl.clientWidth;
+		const ch = canvasEl.clientHeight;
+		const k = zoom ?? Math.max(view.k, 0.6);
+		view.k = k;
+		view.tx = cw / 2 - (node.x ?? 0) * k;
+		view.ty = ch / 2 - (node.y ?? 0) * k;
+		draw();
+		return true;
+	}
+
+	/** Select + centre a node, switching to the level that owns its id. */
+	async function focus(id: string): Promise<boolean> {
+		if (!id) return false;
+		if (!nodeById.has(id)) {
+			// Symbol ids carry a `:line` suffix; everything else is file/dir.
+			const wanted: Level = id.includes(':') ? 'symbol' : 'file';
+			if (level !== wanted) await setLevel(wanted);
+			if (!nodeById.has(id)) return false;
+		}
+		select([id]);
+		centerOn(id);
+		return true;
+	}
+
+	async function focusSymbol(id: string): Promise<void> {
+		if (!nodeById.has(id) || level !== 'symbol') await setLevel('symbol');
+		await focus(id);
+	}
+
+	async function focusFile(fileId: string): Promise<void> {
+		if (!nodeById.has(fileId) || level !== 'file') await setLevel('file', { keepSelection: true });
+		if (nodeById.has(fileId)) {
+			select([fileId]);
+			centerOn(fileId);
+		}
+	}
+
+	// --- Global → Local handoff ---------------------------------------------
+	const HANDOFF_MAX_IDS = 64;
+
+	/** Index symbol ids by file and by every directory prefix (once per graph). */
+	function buildSymbolMaps(source: SgGraph): void {
+		allSymbolIds = new Set();
+		symbolsByFile = new Map();
+		symbolsByDir = new Map();
+		for (const node of source.nodes) {
+			allSymbolIds.add(node.id);
+			const fileList = symbolsByFile.get(node.file);
+			if (fileList) fileList.push(node.id);
+			else symbolsByFile.set(node.file, [node.id]);
+			const parts = node.file.split('/');
+			for (let i = 1; i < parts.length; i++) {
+				const dir = parts.slice(0, i).join('/');
+				const list = symbolsByDir.get(dir);
+				if (list) list.push(node.id);
+				else symbolsByDir.set(dir, [node.id]);
+			}
+		}
+	}
+
+	/** Resolve any mix of symbol / file / dir ids to a de-duplicated symbol list. */
+	function toSymbolIds(ids: readonly string[]): string[] {
+		const out: string[] = [];
+		const seen = new Set<string>();
+		const push = (list: readonly string[] | undefined) => {
+			if (!list) return;
+			for (const id of list) {
+				if (!seen.has(id)) {
+					seen.add(id);
+					out.push(id);
+				}
+			}
+		};
+		for (const id of ids) {
+			if (allSymbolIds.has(id)) push([id]);
+			else if (symbolsByFile.has(id)) push(symbolsByFile.get(id));
+			else push(symbolsByDir.get(id));
+		}
+		return out;
+	}
+
+	function selectionBounds(): { cx: number; cy: number; w: number; h: number } | null {
+		if (!agg || !selection.size) return null;
+		let lx = Infinity;
+		let rx = -Infinity;
+		let ty = Infinity;
+		let by = -Infinity;
+		for (const id of selection) {
+			const node = nodeById.get(id);
+			if (!node) continue;
+			const x = node.x ?? 0;
+			const y = node.y ?? 0;
+			lx = Math.min(lx, x - node.hw);
+			rx = Math.max(rx, x + node.hw);
+			ty = Math.min(ty, y - node.hh);
+			by = Math.max(by, y + node.hh);
+		}
+		if (!Number.isFinite(lx)) return null;
+		return { cx: (lx + rx) / 2, cy: (ty + by) / 2, w: rx - lx, h: ty - by };
+	}
+
+	function zoomToBounds(
+		bounds: { cx: number; cy: number; w: number; h: number },
+		pad = 90
+	): { k: number; tx: number; ty: number } | null {
+		if (!canvasEl) return null;
+		const cw = canvasEl.clientWidth;
+		const ch = canvasEl.clientHeight;
+		const k = Math.max(
+			0.05,
+			Math.min(8, Math.min((cw - pad) / Math.max(1, bounds.w), (ch - pad) / Math.max(1, bounds.h)))
+		);
+		return { k, tx: cw / 2 - bounds.cx * k, ty: ch / 2 - bounds.cy * k };
+	}
+
+	/**
+	 * Briefly zoom + glow the current selection so the handoff reads as a
+	 * continuation rather than a jump cut. Runs `run` once the animation ends;
+	 * falls back to an immediate call when there is nothing to animate.
+	 */
+	async function animateSelection(run: () => void): Promise<void> {
+		const bounds = selectionBounds();
+		const target = bounds ? zoomToBounds(bounds) : null;
+		if (!target || !canvasEl) {
+			run();
+			return;
+		}
+		const start = { k: view.k, tx: view.tx, ty: view.ty };
+		const dur = 240;
+		const t0 = performance.now();
+		await new Promise<void>((resolve) => {
+			const step = (now: number) => {
+				const t = Math.min(1, (now - t0) / dur);
+				const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+				view.k = start.k + (target.k - start.k) * e;
+				view.tx = start.tx + (target.tx - start.tx) * e;
+				view.ty = start.ty + (target.ty - start.ty) * e;
+				elevate = Math.sin(Math.PI * t);
+				draw();
+				if (t < 1) requestAnimationFrame(step);
+				else {
+					elevate = 0;
+					draw();
+					resolve();
+				}
+			};
+			requestAnimationFrame(step);
+		});
+		run();
+	}
+
+	/** Persist the selection and navigate to Local, with a short pre-animation. */
+	function openLocal(ids?: string[]): void {
+		if (navigating) return;
+		const symbols = toSymbolIds(ids ?? [...selection]);
+		if (!symbols.length) return;
+		const capped =
+			symbols.length > HANDOFF_MAX_IDS ? symbols.slice(0, HANDOFF_MAX_IDS) : symbols;
+		try {
+			localStorage.setItem(HANDOFF_KEY, JSON.stringify({ ids: capped, ts: Date.now() }));
+		} catch {
+			/* storage unavailable — the query string still carries the ids */
+		}
+		navigating = true;
+		void animateSelection(() => {
+			void goto('/local?ids=' + capped.join(','))
+				.catch(() => undefined)
+				.finally(() => {
+					navigating = false;
+				});
+		});
+	}
+
+	// --- keyboard navigation -------------------------------------------------
+	function zoomBy(factor: number): void {
+		if (!canvasEl) return;
+		const cx = canvasEl.clientWidth / 2;
+		const cy = canvasEl.clientHeight / 2;
+		const k = Math.max(0.02, Math.min(40, view.k * factor));
+		const wx = (cx - view.tx) / view.k;
+		const wy = (cy - view.ty) / view.k;
+		view.k = k;
+		view.tx = cx - wx * k;
+		view.ty = cy - wy * k;
+		draw();
+	}
+
+	function fitView(): void {
+		fit();
+		draw();
+	}
+
+	/** Move the single selection to the nearest node in `dir` (aligned-bias). */
+	function moveSelection(dir: 'left' | 'right' | 'up' | 'down'): void {
+		if (!agg || !agg.nodes.length) return;
+		let current: AggNode | undefined;
+		if (selection.size === 1) current = nodeById.get([...selection][0]);
+		if (!current) {
+			const cx = canvasEl ? canvasEl.clientWidth / 2 : 0;
+			const cy = canvasEl ? canvasEl.clientHeight / 2 : 0;
+			let best = Infinity;
+			for (const node of agg.nodes) {
+				const [sx, sy] = worldToScreen(node.x ?? 0, node.y ?? 0);
+				const d = (sx - cx) ** 2 + (sy - cy) ** 2;
+				if (d < best) {
+					best = d;
+					current = node;
+				}
+			}
+		}
+		if (!current) return;
+		const cx = current.x ?? 0;
+		const cy = current.y ?? 0;
+		let best: AggNode | null = null;
+		let bestScore = Infinity;
+		for (const node of agg.nodes) {
+			if (node === current) continue;
+			const dx = (node.x ?? 0) - cx;
+			const dy = (node.y ?? 0) - cy;
+			let primary: number;
+			let cross: number;
+			if (dir === 'right') {
+				if (dx <= 0.5) continue;
+				primary = dx;
+				cross = Math.abs(dy);
+			} else if (dir === 'left') {
+				if (dx >= -0.5) continue;
+				primary = -dx;
+				cross = Math.abs(dy);
+			} else if (dir === 'down') {
+				if (dy <= 0.5) continue;
+				primary = dy;
+				cross = Math.abs(dx);
+			} else {
+				if (dy >= -0.5) continue;
+				primary = -dy;
+				cross = Math.abs(dx);
+			}
+			const score = primary + cross * 2.2;
+			if (score < bestScore) {
+				bestScore = score;
+				best = node;
+			}
+		}
+		if (best) {
+			select([best.id]);
+			centerOn(best.id, Math.max(view.k, 0.5));
+		}
+	}
+
+	function isTypingTarget(target: EventTarget | null): boolean {
+		const el = target as HTMLElement | null;
+		if (!el) return false;
+		return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
+	}
+
+	function focusOutlineSearch(): void {
+		const input = document.getElementById('outline-search-input') as HTMLInputElement | null;
+		input?.focus();
+		input?.select();
+	}
+
+	function jumpCurrent(): void {
+		const id = selection.size ? [...selection][0] : null;
+		const node = id ? nodeById.get(id) : null;
+		if (!node) {
+			showToast('no selection to jump from');
+			return;
+		}
+		const target = jumpToSource(node);
+		showToast(
+			target
+				? `jump → ${target.file}:${target.line}:${target.column}`
+				: `no source range for ${node.label}`
+		);
+	}
+
+	function onKeyDown(event: KeyboardEvent): void {
+		if (event.key === 'Escape') {
+			if (helpOpen) {
+				helpOpen = false;
+				return;
+			}
+			if (isTypingTarget(event.target)) return;
+			if (selection.size) {
+				select([]);
+				draw();
+			}
+			return;
+		}
+		if (isTypingTarget(event.target)) return;
+		const key = event.key;
+		if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown') {
+			event.preventDefault();
+			moveSelection(
+				key === 'ArrowLeft'
+					? 'left'
+					: key === 'ArrowRight'
+						? 'right'
+						: key === 'ArrowUp'
+							? 'up'
+							: 'down'
+			);
+			return;
+		}
+		if (key === '+' || key === '=') {
+			event.preventDefault();
+			zoomBy(1.2);
+			return;
+		}
+		if (key === '-' || key === '_') {
+			event.preventDefault();
+			zoomBy(1 / 1.2);
+			return;
+		}
+		if (key === '0') {
+			event.preventDefault();
+			fitView();
+			return;
+		}
+		if (key === '/') {
+			event.preventDefault();
+			focusOutlineSearch();
+			return;
+		}
+		if (key === '?') {
+			event.preventDefault();
+			helpOpen = !helpOpen;
+			return;
+		}
+		if (key === 'Enter') {
+			event.preventDefault();
+			if (selection.size) openLocal([...selection]);
+			return;
+		}
+		if (key === 'j' || key === 'J') {
+			event.preventDefault();
+			jumpCurrent();
+		}
 	}
 
 	// -------------------------------------------------------------------------
@@ -614,6 +982,7 @@
 
 	onMount(() => {
 		graph = data.graph;
+		if (graph) buildSymbolMaps(graph);
 		if (!canvasEl) return;
 		ctx = canvasEl.getContext('2d');
 
@@ -634,6 +1003,9 @@
 
 		canvasEl.addEventListener('wheel', onWheel, { passive: false });
 		window.addEventListener('resize', resize);
+		window.addEventListener('keydown', onKeyDown);
+		const resizeObserver = new ResizeObserver(() => resize());
+		resizeObserver.observe(canvasEl);
 
 		const handle = {
 			setLevel,
@@ -645,6 +1017,10 @@
 				fit();
 				draw();
 			},
+			focus: (id: string) => focus(id),
+			center: (id: string) => centerOn(id),
+			openLocal: (ids?: string[]) => openLocal(ids),
+			level: () => level,
 			labels: () =>
 				(agg?.nodes ?? []).map((n) => ({ id: n.id, name: n.name, label: n.label })),
 			nodeIds: () => (agg?.nodes ?? []).map((n) => n.id),
@@ -662,6 +1038,8 @@
 
 		return () => {
 			window.removeEventListener('resize', resize);
+			window.removeEventListener('keydown', onKeyDown);
+			resizeObserver.disconnect();
 			canvasEl?.removeEventListener('wheel', onWheel);
 			worker?.terminate();
 			worker = null;
@@ -679,7 +1057,29 @@
 	<title>Global density · scip-graph</title>
 </svelte:head>
 
-<div class="stage">
+<div class="workspace">
+	{#if !outlineCollapsed}
+		<OutlineTree
+			{graph}
+			selected={selectedKeys}
+			onselect={(ids) => {
+				select(ids);
+				draw();
+			}}
+			onfocussymbol={(id) => void focusSymbol(id)}
+			onfocusfile={(id) => void focusFile(id)}
+			onopenlocal={(ids) => openLocal(ids)}
+		/>
+	{/if}
+	<button
+		class="outline-toggle"
+		title={outlineCollapsed ? 'show outline' : 'hide outline'}
+		aria-label={outlineCollapsed ? 'show outline' : 'hide outline'}
+		onclick={() => (outlineCollapsed = !outlineCollapsed)}
+	>
+		{outlineCollapsed ? '»' : '«'}
+	</button>
+	<div class="stage">
 	<canvas
 		bind:this={canvasEl}
 		class:panning
@@ -709,6 +1109,7 @@
 				}}
 				title="fit graph to view">fit</button
 			>
+			<button onclick={() => (helpOpen = !helpOpen)} title="keyboard shortcuts (?)">?</button>
 		</div>
 		<div class="group">
 			<input
@@ -729,7 +1130,7 @@
 	</div>
 
 	<div class="hint">
-		drag = pan · wheel = zoom · shift+drag = box-select · dbl-click = select · right-click = jump
+		drag pan · wheel zoom · shift+drag select · / search · arrows move · Enter → Local · j jump · ? help
 	</div>
 
 	{#if tooltip}
@@ -741,7 +1142,7 @@
 	{/if}
 
 	{#if selectionCount > 0}
-		<button class="jump" onclick={jumpToLocal}>→ Local ({selectionCount})</button>
+		<button class="jump" onclick={() => openLocal()}>→ Local ({selectionCount})</button>
 	{/if}
 
 	{#if status}
@@ -758,11 +1159,61 @@
 			style={`left:${selBox.x}px; top:${selBox.y}px; width:${selBox.w}px; height:${selBox.h}px`}
 		></div>
 	{/if}
+
+	{#if helpOpen}
+		<div class="help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+			<div class="help-card">
+				<h3>Keyboard shortcuts</h3>
+				<dl>
+					<dt>← ↑ → ↓</dt><dd>move selection to nearest node</dd>
+					<dt>+ / −</dt><dd>zoom in / out</dd>
+					<dt>0</dt><dd>fit graph</dd>
+					<dt>/</dt><dd>focus outline search</dd>
+					<dt>Enter</dt><dd>open selection in Local</dd>
+					<dt>j</dt><dd>jump to source</dd>
+					<dt>Esc</dt><dd>clear selection / close help</dd>
+					<dt>?</dt><dd>toggle this help</dd>
+				</dl>
+				<button onclick={() => (helpOpen = false)}>close</button>
+			</div>
+		</div>
+	{/if}
+	</div>
 </div>
 
 <style>
 	:global(body) {
 		background: #f6f7f9;
+	}
+
+	.workspace {
+		display: flex;
+		align-items: stretch;
+		gap: 8px;
+	}
+
+	.workspace .stage {
+		flex: 1 1 auto;
+		min-width: 0;
+	}
+
+	.outline-toggle {
+		align-self: flex-start;
+		margin-top: 8px;
+		padding: 6px 3px;
+		font: inherit;
+		font-size: 13px;
+		line-height: 1;
+		color: #8b98a8;
+		background: #212a36;
+		border: 1px solid #2a3340;
+		border-radius: 6px;
+		cursor: pointer;
+	}
+
+	.outline-toggle:hover {
+		color: #ffd54a;
+		border-color: #ffd54a;
 	}
 
 	.stage {
@@ -942,5 +1393,45 @@
 		border: 1px dashed #ffd54a;
 		background: #ffd54a22;
 		pointer-events: none;
+	}
+
+	.help {
+		position: absolute;
+		inset: 0;
+		z-index: 10;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: #0b0f1499;
+	}
+
+	.help-card {
+		min-width: 320px;
+		padding: 16px 20px;
+		color: #d5dde8;
+		background: #171c24f2;
+		border: 1px solid #2a3340;
+		border-radius: 10px;
+		box-shadow: 0 18px 48px #0008;
+	}
+
+	.help-card h3 {
+		margin: 0 0 10px;
+		color: #ffd54a;
+	}
+
+	.help-card dl {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 4px 14px;
+		margin: 0 0 12px;
+	}
+
+	.help-card dt {
+		color: #9fd0e8;
+	}
+
+	.help-card dd {
+		margin: 0;
 	}
 </style>
