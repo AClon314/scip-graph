@@ -137,6 +137,41 @@
 	/** Reactive mirror of the canvas selection for the outline sidebar. */
 	let selectedKeys = $state<string[]>([]);
 
+	/**
+	 * Distinct callers/callees of the current selection, computed from the live
+	 * aggregation so it is correct at dir/file/symbol. `callers` are sources of
+	 * incoming edges whose target is selected (source unselected); `callees` are
+	 * targets of outgoing edges whose source is selected (target unselected).
+	 */
+	const selectionNeighbors = $derived.by(() => {
+		// Read `level` so the derived re-runs whenever the aggregation is rebuilt
+		// for a new level, even when the selected ids are unchanged (keepSelection).
+		void level;
+		if (!selectedKeys.length || !agg) return { callers: 0, callees: 0, edges: 0 };
+		const set = new Set(selectedKeys);
+		const seenCallers = new Set<string>();
+		const seenCallees = new Set<string>();
+		let callers = 0;
+		let callees = 0;
+		let edges = 0;
+		for (const e of agg.edges) {
+			const srcIn = set.has(e.source);
+			const dstIn = set.has(e.target);
+			if (srcIn === dstIn) continue;
+			edges++;
+			if (dstIn) {
+				if (!seenCallers.has(e.source)) {
+					seenCallers.add(e.source);
+					callers++;
+				}
+			} else if (!seenCallees.has(e.target)) {
+				seenCallees.add(e.target);
+				callees++;
+			}
+		}
+		return { callers, callees, edges };
+	});
+
 	// -------------------------------------------------------------------------
 	// helpers
 	// -------------------------------------------------------------------------
@@ -787,7 +822,17 @@
 		{/if}
 
 		{#if selectionCount > 0}
-			<button class="jump" onclick={() => openLocal()}>→ Local ({selectionCount})</button>
+			<div class="sel-actions">
+				<div
+					class="sel-status"
+					title="callers: distinct nodes outside the selection that call into it · callees: distinct nodes outside the selection it calls"
+				>
+					callers {selectionNeighbors.callers} · callees {selectionNeighbors.callees}{selectionCount > 1
+						? ` · edges ${selectionNeighbors.edges}`
+						: ''}
+				</div>
+				<button class="jump" onclick={() => openLocal()}>→ Local ({selectionCount})</button>
+			</div>
 		{/if}
 
 		{#if status}
@@ -923,10 +968,28 @@
 		color: #8b98a8;
 	}
 
-	.jump {
+	.sel-actions {
 		position: absolute;
 		right: 14px;
 		bottom: 14px;
+		z-index: 6;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+
+	.sel-status {
+		padding: 5px 10px;
+		font-size: 12px;
+		font-variant-numeric: tabular-nums;
+		color: #cbd5e1;
+		background: #171c24cc;
+		border: 1px solid #2a3340;
+		border-radius: 6px;
+		white-space: nowrap;
+	}
+
+	.jump {
 		padding: 8px 14px;
 		font-size: 13px;
 		font-weight: 700;
