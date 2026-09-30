@@ -17,8 +17,10 @@
 		type LocalOptions,
 		type SortMode
 	} from '$lib/local/model';
-	import { createRenderer, type Renderer } from '$lib/local/render';
+	import { createRenderer, type FocusInfo, type Renderer } from '$lib/local/render';
 	import { jumpToSource } from '$lib/local/jump';
+	import { isEditorConfigured, resolveEditorUrl } from '$lib/editor';
+	import ShortcutHelp from '$lib/components/ShortcutHelp.svelte';
 
 	const DEFAULT_CENTER = 'src/lib/components/areas/CodeArea.svelte:86';
 	const DEFAULT_STATUS =
@@ -50,6 +52,12 @@
 		};
 		setSort(mode: string): boolean;
 		toggle(name: string): boolean;
+		reveal(target: string): boolean;
+		focus(): FocusInfo | null;
+		setFocus(target: string | null): boolean;
+		moveFocus(dir: 'up' | 'down' | 'left' | 'right'): FocusInfo | null;
+		editorUrl(nodeOrId: SgNode | string): string | null;
+		hops(enabled?: boolean): boolean;
 		detail(): Array<{
 			key: string;
 			items: Array<{
@@ -97,6 +105,11 @@
 	let shell = $state<HTMLDivElement | null>(null);
 	let renderer: Renderer | null = null;
 	let hoveredItem: LocalItem | null = null;
+	let focusedItem: LocalItem | null = null;
+	let toast = $state('');
+	let showHelp = $state(false);
+	let searchInput = $state<HTMLInputElement | null>(null);
+	let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const chips = $derived(
 		centerIds.map((id) => ({ id, node: graph ? (graph.nodesById.get(id) ?? null) : null }))
@@ -243,6 +256,7 @@
 	}
 
 	function onOptionChange(key: keyof LocalOptions): void {
+		if (key === 'hops') return; // pure rendering toggle; no relayout
 		rebuild(key === 'showFile' || key === 'perCallArrows');
 	}
 
@@ -255,12 +269,7 @@
 		setCenter([item.id]);
 	}
 
-	function onNodeHover(item: LocalItem | null): void {
-		hoveredItem = item;
-		if (!item) {
-			updateStatusDefault();
-			return;
-		}
+	function describeItem(item: LocalItem): string {
 		const members =
 			item.members && item.members.size
 				? [...item.members].map((id) => graph?.nodesById.get(id)?.name || id)
@@ -268,7 +277,16 @@
 		const memberNote =
 			members.length > 1 ? `  ↔ ${members.join(', ')}` : members.length === 1 ? `  ↔ ${members[0]}` : '';
 		const unreachable = item.unreachable ? '  [unreachable]' : '';
-		statusText = `${item.node.name}  ${item.node.file}:${item.node.line}  (${item.node.kind}, w=${item.node.weight})${memberNote}${unreachable}  · j jumps`;
+		return `${item.node.name}  ${item.node.file}:${item.node.line}  (${item.node.kind}, w=${item.node.weight})${memberNote}${unreachable}`;
+	}
+
+	function onNodeHover(item: LocalItem | null): void {
+		hoveredItem = item;
+		if (!item) {
+			updateStatusDefault();
+			return;
+		}
+		statusText = `${describeItem(item)}  · j jumps`;
 	}
 
 	function updateStatusDefault(): void {
@@ -293,10 +311,76 @@
 		rebuild();
 	}
 
-	function jumpHovered(): void {
-		if (!hoveredItem) return;
-		const req = jumpToSource(hoveredItem.node);
-		statusText = `jump → ${req.file}:${req.line}${req.range ? ` (col ${req.range.start.column})` : ''}`;
+	function showToast(message: string, ms = 4200): void {
+		toast = message;
+		if (toastTimer) clearTimeout(toastTimer);
+		toastTimer = setTimeout(() => (toast = ''), ms);
+	}
+
+	function setHops(on: boolean): void {
+		if (options.hops === on) {
+			showToast(`hops already ${on ? 'on' : 'off'}`);
+			return;
+		}
+		options.hops = on;
+		showToast(`hops ${on ? 'on' : 'off'} — semicircles where visible edges cross`);
+	}
+
+	function findNode(target: string): SgNode | null {
+		if (!graph) return null;
+		const t = target.trim();
+		if (!t) return null;
+		const direct = graph.nodesById.get(t);
+		if (direct) return direct;
+		const m = t.match(/^(.*):(\d+)\s*$/);
+		if (m) {
+			const file = m[1];
+			const line = Number(m[2]);
+			const exact = graph.nodes.find((n) => n.file === file && n.line === line);
+			if (exact) return exact;
+		}
+		return graph.nodes.find((n) => n.file === t) ?? null;
+	}
+
+	function focusStatus(item: LocalItem): string {
+		return `focus: ${describeItem(item)}  · enter re-centers · shift+enter adds/removes · j jumps`;
+	}
+
+	function moveFocus(dir: 'up' | 'down' | 'left' | 'right'): void {
+		const it = renderer?.moveFocus(dir) ?? null;
+		focusedItem = it;
+		if (it) statusText = focusStatus(it);
+	}
+
+	/** Reveal/highlight a node by id or `file:line` (also `?focus=` and `scip-graph:focus`). */
+	function reveal(target: string): boolean {
+		const node = findNode(target);
+		if (!node) {
+			showToast(`reveal: no node matched “${target}”`);
+			return false;
+		}
+		setCenter([node.id]);
+		renderer?.setFocus(`C\u0000${node.id}`);
+		const it = columns.find((c) => c.key === 'C')?.items.find((i) => i.id === node.id) ?? null;
+		focusedItem = it;
+		statusText = it ? `revealed: ${describeItem(it)}` : `revealed: ${node.name}  ${node.file}:${node.line}`;
+		showToast(`revealed ${node.name} · ${node.file}:${node.line}`);
+		return true;
+	}
+
+	function jumpNode(item: LocalItem | null): void {
+		if (!item) {
+			showToast('nothing focused to jump to — use arrow keys to focus a node');
+			return;
+		}
+		const req = jumpToSource(item.node);
+		if (isEditorConfigured() && req.editorUrl) {
+			statusText = `open → ${req.editorUrl}`;
+			showToast(`open in editor → ${req.editorUrl}`);
+		} else {
+			statusText = `no editor configured · jump → ${req.file}:${req.line} (set PUBLIC_SCIP_GRAPH_EDITOR)`;
+			showToast(`no editor configured — ${req.file}:${req.line}. Set PUBLIC_SCIP_GRAPH_EDITOR.`);
+		}
 	}
 
 	onMount(() => {
@@ -328,23 +412,98 @@
 			const hit = renderer.hitTest(ev.clientX - rect.left, ev.clientY - rect.top);
 			if (!hit) return;
 			ev.preventDefault();
-			const req = jumpToSource(hit.item.node);
-			statusText = `jump → ${req.file}:${req.line}${req.range ? ` (col ${req.range.start.column})` : ''}`;
+			jumpNode(hit.item);
 		};
+
+		const isTyping = (el: EventTarget | null): boolean => {
+			const node = el as HTMLElement | null;
+			if (!node) return false;
+			const tag = node.tagName;
+			return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable;
+		};
+
 		const onKeyDown = (ev: KeyboardEvent): void => {
-			if (ev.key === 'j' && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
-				const target = ev.target as HTMLElement | null;
-				if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
-				jumpHovered();
+			if (ev.key === 'Escape') {
+				renderer?.clearFocus();
+				focusedItem = null;
+				showHelp = false;
+				updateStatusDefault();
+				return;
+			}
+			if (isTyping(ev.target)) return;
+			switch (ev.key) {
+				case 'ArrowUp':
+					ev.preventDefault();
+					moveFocus('up');
+					break;
+				case 'ArrowDown':
+					ev.preventDefault();
+					moveFocus('down');
+					break;
+				case 'ArrowLeft':
+					ev.preventDefault();
+					moveFocus('left');
+					break;
+				case 'ArrowRight':
+					ev.preventDefault();
+					moveFocus('right');
+					break;
+				case 'Enter':
+					ev.preventDefault();
+					if (focusedItem) {
+						if (ev.shiftKey) toggleCenter(focusedItem.id);
+						else setCenter([focusedItem.id]);
+					}
+					break;
+				case '+':
+				case '=':
+					ev.preventDefault();
+					setHops(true);
+					break;
+				case '-':
+				case '_':
+					ev.preventDefault();
+					setHops(false);
+					break;
+				case 'j':
+					ev.preventDefault();
+					jumpNode(focusedItem ?? hoveredItem);
+					break;
+				case '/':
+					ev.preventDefault();
+					searchInput?.focus();
+					searchInput?.select();
+					break;
+				case '?':
+					ev.preventDefault();
+					showHelp = !showHelp;
+					break;
 			}
 		};
+
+		const onFocusEvent = (ev: Event): void => {
+			const detail = (ev as CustomEvent<unknown>).detail;
+			let target: string | null = null;
+			if (typeof detail === 'string') target = detail;
+			else if (detail && typeof detail === 'object') {
+				const d = detail as { id?: unknown; file?: unknown; line?: unknown };
+				if (typeof d.id === 'string') target = d.id;
+				else if (typeof d.file === 'string' && typeof d.line === 'number') target = `${d.file}:${d.line}`;
+			}
+			if (target) reveal(target);
+		};
+
 		canvas.addEventListener('contextmenu', onContextMenu);
 		window.addEventListener('keydown', onKeyDown);
+		window.addEventListener('scip-graph:focus', onFocusEvent);
 
 		centerIds = resolveInitialCenter();
 		rebuild();
 		updateStatusDefault();
 		renderer.start();
+
+		const focusParam = page.url.searchParams.get('focus');
+		if (focusParam) reveal(focusParam);
 
 		const api: LocalDebugApi = {
 			setCenter(ids: string | string[]): boolean {
@@ -352,6 +511,35 @@
 			},
 			setSort,
 			toggle,
+			reveal,
+			focus() {
+				return renderer?.focusInfo() ?? null;
+			},
+			setFocus(target: string | null): boolean {
+				if (target === null) {
+					renderer?.clearFocus();
+					focusedItem = null;
+					return true;
+				}
+				const node = findNode(target);
+				if (!node) return false;
+				renderer?.setFocus(`C\u0000${node.id}`);
+				focusedItem = renderer?.getFocused() ?? null;
+				return true;
+			},
+			moveFocus(dir: 'up' | 'down' | 'left' | 'right') {
+				const it = renderer?.moveFocus(dir) ?? null;
+				focusedItem = it;
+				return renderer?.focusInfo() ?? null;
+			},
+			editorUrl(nodeOrId: SgNode | string): string | null {
+				const node = typeof nodeOrId === 'string' ? findNode(nodeOrId) : nodeOrId;
+				return node ? resolveEditorUrl(node) : null;
+			},
+			hops(enabled?: boolean): boolean {
+				setHops(typeof enabled === 'boolean' ? enabled : !options.hops);
+				return options.hops;
+			},
 			state() {
 				return {
 					center: [...centerIds],
@@ -385,7 +573,9 @@
 		return () => {
 			window.removeEventListener('resize', fit);
 			window.removeEventListener('keydown', onKeyDown);
+			window.removeEventListener('scip-graph:focus', onFocusEvent);
 			canvas?.removeEventListener('contextmenu', onContextMenu);
+			if (toastTimer) clearTimeout(toastTimer);
 			renderer?.stop();
 			renderer = null;
 		};
@@ -424,6 +614,7 @@
 				placeholder="add node id…"
 				spellcheck="false"
 				bind:value={addValue}
+				bind:this={searchInput}
 				onkeydown={(e) => {
 					if (e.key === 'Enter') addFromInput();
 				}}
@@ -492,10 +683,15 @@
 			name + file
 		</label>
 		<label class="group chk">
+			<input type="checkbox" bind:checked={options.hops} onchange={() => onOptionChange('hops')} />
+			hops on crossings
+		</label>
+		<label class="group chk">
 			<input type="checkbox" bind:checked={multiMode} />
 			multi (click = add/remove)
 		</label>
 		<button class="btn" title="reset focus and options" onclick={resetView}>reset</button>
+		<button class="btn" title="keyboard shortcuts (press ?)" onclick={() => (showHelp = !showHelp)}>?</button>
 	</header>
 
 	<main class="stageWrap">
@@ -525,6 +721,14 @@
 		</span>
 		<span class="status">{statusText}</span>
 	</footer>
+
+	{#if toast}
+		<div class="toast" role="status" aria-live="polite">{toast}</div>
+	{/if}
+
+	{#if showHelp}
+		<ShortcutHelp onclose={() => (showHelp = false)} />
+	{/if}
 </div>
 
 <style>
@@ -738,5 +942,22 @@
 		background: #0f141b;
 		padding: 0.1rem 0.35rem;
 		border-radius: 4px;
+	}
+
+	.toast {
+		position: absolute;
+		right: 1.6ch;
+		bottom: 5.5lh;
+		max-width: 62ch;
+		padding: 0.5lh 1.2ch;
+		background: rgba(20, 26, 34, 0.96);
+		border: 1px solid #b98cff;
+		border-radius: 7px;
+		color: #e2d5ff;
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 12px;
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+		z-index: 20;
+		pointer-events: none;
 	}
 </style>
