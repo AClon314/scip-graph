@@ -2,7 +2,8 @@
  * Canvas 2D renderer for the butterfly view (faithful TS port of
  * `view-b/render.js`): columns of nodes, per-layer independent smooth scroll,
  * bezier links with fading arrowheads, clickable nodes. The centre column never
- * scrolls and stays horizontally fixed.
+ * scrolls vertically; the whole column strip can pan horizontally when the
+ * dynamic ±N depth makes it wider than the viewport.
  */
 import type { LocalColumn, LocalItem, LocalLink, LocalOptions } from '$lib/local/model';
 
@@ -41,13 +42,24 @@ type Geo = {
 	boxes: Box[];
 };
 
-const DEPTH_SCALE: Record<number, number> = { 0: 1, 1: 0.82, 2: 0.66 };
 const BASE_W = 214;
 const BASE_H = 58;
 const ROW_GAP = 16;
 const GAP_X = 104;
 const CONTENT_TOP = 58;
 const CONTENT_BOTTOM = 34;
+
+// Horizontal strip scrolling (only active when the columns overflow).
+const STRIP_MARGIN = 24;
+const HSCROLL_H = 6;
+const HSCROLL_MARGIN = 44;
+const HSCROLL_BOTTOM = 16;
+
+// Deeper columns shrink gently; never below half size.
+const DEPTH_SCALE_MIN = 0.5;
+function depthScale(depth: number): number {
+	return Math.max(DEPTH_SCALE_MIN, 1 - 0.17 * depth);
+}
 
 // Crossing hops (visual only). Sample the drawn beziers, find crossings, then
 // bridge one edge of each crossing with a near-semicircle bump.
@@ -111,6 +123,25 @@ export function createRenderer(
 	let raf: number | null = null;
 	let lastT = 0;
 	let lastGeo: Geo[] = [];
+	let panInst = 0;
+	let panSmooth = 0;
+	let lastStrip: Strip | null = null;
+
+	type Strip = {
+		left0: number;
+		right0: number;
+		contentW: number;
+		minPan: number;
+		maxPan: number;
+		fits: boolean;
+		trackX: number;
+		trackW: number;
+		thumbW: number;
+	};
+
+	type Drag = { mode: 'pan' | 'thumb'; startX: number; startPan: number; moved: boolean };
+	let drag: Drag | null = null;
+	let suppressClick = false;
 
 	function getScroll(key: string): { inst: number; smooth: number; max: number } {
 		let s = scroll.get(key);
@@ -119,7 +150,7 @@ export function createRenderer(
 	}
 
 	function dimsFor(depth: number): { w: number; h: number; rowGap: number; scale: number } {
-		const s = zoom * (DEPTH_SCALE[depth] ?? 1);
+		const s = zoom * depthScale(depth);
 		return { w: BASE_W * s, h: BASE_H * s, rowGap: ROW_GAP * s, scale: s };
 	}
 
@@ -141,25 +172,64 @@ export function createRenderer(
 		const centerX = cssW / 2 - cd.w / 2;
 		const gap = GAP_X * zoom + 26;
 
+		const rightCols = data.columns.filter((c) => c.side === 'right').sort((a, b) => a.depth - b.depth);
+		const leftCols = data.columns.filter((c) => c.side === 'left').sort((a, b) => a.depth - b.depth);
+
 		let x = centerX + cd.w + gap;
 		const right: Geo[] = [];
-		for (const key of ['R1', 'R2']) {
-			const col = byKey.get(key);
-			if (!col) continue;
+		for (const col of rightCols) {
 			const d = dimsFor(col.depth);
 			right.push({ col, x, ...d, boxes: [], step: 0, contentH: 0, availH: 0 });
 			x += d.w + gap;
 		}
 		let lx = centerX - gap;
 		const left: Geo[] = [];
-		for (const key of ['L1', 'L2']) {
-			const col = byKey.get(key);
-			if (!col) continue;
+		for (const col of leftCols) {
 			const d = dimsFor(col.depth);
 			left.push({ col, x: lx - d.w, ...d, boxes: [], step: 0, contentH: 0, availH: 0 });
 			lx = lx - d.w - gap;
 		}
-		geo.push(...left.reverse(), { col: center, x: centerX, ...cd, boxes: [], step: 0, contentH: 0, availH: 0 }, ...right);
+		// visual order: deepest-left … L1, C, R1 … deepest-right
+		geo.push(
+			...left.reverse(),
+			{ col: center, x: centerX, ...cd, boxes: [], step: 0, contentH: 0, availH: 0 },
+			...right
+		);
+
+		// --- horizontal strip / pan clamp -----------------------------------
+		let left0 = Infinity;
+		let right0 = -Infinity;
+		for (const g of geo) {
+			left0 = Math.min(left0, g.x);
+			right0 = Math.max(right0, g.x + g.w);
+		}
+		if (!Number.isFinite(left0)) {
+			left0 = 0;
+			right0 = cssW;
+		}
+		const contentW = Math.max(1, right0 - left0);
+		// A couple of px of slack; the strip only scrolls when it truly overflows.
+		const fits = contentW <= cssW - 2;
+		let minPan = 0;
+		let maxPan = 0;
+		if (fits) {
+			// centre stays anchored when the whole strip fits
+			panInst = 0;
+			panSmooth = 0;
+		} else {
+			// maxPan reveals the leftmost column, minPan the rightmost
+			maxPan = STRIP_MARGIN - left0;
+			minPan = cssW - STRIP_MARGIN - right0;
+			panInst = clamp(panInst, minPan, maxPan);
+			panSmooth = clamp(panSmooth, minPan, maxPan);
+		}
+		const trackX = HSCROLL_MARGIN;
+		const trackW = Math.max(1, cssW - HSCROLL_MARGIN * 2);
+		const thumbW = fits ? trackW : Math.max(36, Math.min(trackW, trackW * (cssW / contentW)));
+		lastStrip = { left0, right0, contentW, minPan, maxPan, fits, trackX, trackW, thumbW };
+
+		const pan = fits ? 0 : panSmooth;
+		if (pan) for (const g of geo) g.x += pan;
 
 		const availH = Math.max(60, cssH - CONTENT_TOP - CONTENT_BOTTOM);
 		for (const g of geo) {
@@ -184,6 +254,17 @@ export function createRenderer(
 		}
 		lastGeo = geo;
 		return geo;
+	}
+
+	// Deepest visible column key on each side (for the fading "more" stubs).
+	function outerKeys(): { left: string | null; right: string | null } {
+		let l = 0;
+		let r = 0;
+		for (const c of data.columns) {
+			if (c.side === 'left' && c.depth > l) l = c.depth;
+			if (c.side === 'right' && c.depth > r) r = c.depth;
+		}
+		return { left: l ? `L${l}` : null, right: r ? `R${r}` : null };
 	}
 
 	function boxMap(geo: Geo[]): Map<string, Box> {
@@ -539,6 +620,25 @@ export function createRenderer(
 		ctx.restore();
 	}
 
+	// Horizontal scrollbar for the whole column strip; only shown when it
+	// overflows the viewport. Thumb at the left = leftmost columns revealed.
+	function drawHScrollbar(): void {
+		const s = lastStrip;
+		if (!s || s.fits || s.maxPan <= s.minPan) return;
+		const y = cssH - HSCROLL_BOTTOM;
+		const range = s.maxPan - s.minPan;
+		const t = range > 0 ? clamp((panSmooth - s.minPan) / range, 0, 1) : 0;
+		const thumbX = s.trackX + (1 - t) * (s.trackW - s.thumbW);
+		ctx.save();
+		ctx.fillStyle = 'rgba(255,255,255,0.06)';
+		roundRect(s.trackX, y, s.trackW, HSCROLL_H, HSCROLL_H / 2);
+		ctx.fill();
+		ctx.fillStyle = 'rgba(160,190,230,0.45)';
+		roundRect(thumbX, y, s.thumbW, HSCROLL_H, HSCROLL_H / 2);
+		ctx.fill();
+		ctx.restore();
+	}
+
 	function draw(): void {
 		const opts = getOptions();
 		const geo = layout();
@@ -553,9 +653,10 @@ export function createRenderer(
 		if (hops) for (const arr of hops.values()) lastHopCount += arr.length;
 		for (const rec of data.edges) drawEdge(rec, boxes, opts, hops ? (hops.get(rec.from.uid) ?? null) : null);
 
-		// fading stubs for hidden grandparents / grandchildren
+		// fading stubs for hidden neighbours beyond the deepest visible column
+		const outer = outerKeys();
 		for (const g of geo) {
-			if (g.col.key !== 'L2' && g.col.key !== 'R2') continue;
+			if (g.col.key !== outer.left && g.col.key !== outer.right) continue;
 			for (const box of g.boxes) {
 				if (box.it.hasMore) drawStub(box, g.col.side === 'left' ? 'left' : 'right', 0.3);
 			}
@@ -584,6 +685,7 @@ export function createRenderer(
 		ctx.restore();
 
 		for (const g of geo) if (g.col.key !== 'C') drawScrollbar(g);
+		drawHScrollbar();
 	}
 
 	function tick(t: number): void {
@@ -596,6 +698,7 @@ export function createRenderer(
 			s.smooth += (s.inst - s.smooth) * k;
 		}
 		zoom += (zoomTarget - zoom) * k;
+		panSmooth += (panInst - panSmooth) * k;
 		draw();
 		raf = requestAnimationFrame(tick);
 	}
@@ -647,6 +750,14 @@ export function createRenderer(
 		const cy = box.y + box.h / 2;
 		if (cy - box.h / 2 < top) s.inst = clamp(s.inst - (top - (cy - box.h / 2)) - 8, 0, s.max);
 		else if (cy + box.h / 2 > bottom) s.inst = clamp(s.inst + (cy + box.h / 2 - bottom) + 8, 0, s.max);
+		// keep the focused column visible horizontally too
+		const strip = lastStrip;
+		if (strip && !strip.fits) {
+			const m = STRIP_MARGIN;
+			if (box.x < m) panInst = clamp(panInst + (m - box.x), strip.minPan, strip.maxPan);
+			else if (box.x + box.w > cssW - m)
+				panInst = clamp(panInst - (box.x + box.w - (cssW - m)), strip.minPan, strip.maxPan);
+		}
 	}
 
 	function setFocus(uid: string | null): void {
@@ -748,6 +859,8 @@ export function createRenderer(
 			s.inst = 0;
 			s.smooth = 0;
 		}
+		panInst = 0;
+		panSmooth = 0;
 	}
 
 	function onWheel(e: WheelEvent): void {
@@ -756,6 +869,15 @@ export function createRenderer(
 		if (e.ctrlKey || e.metaKey) {
 			e.preventDefault();
 			zoomTarget = clamp(zoomTarget * Math.exp(-e.deltaY * 0.0016), 0.32, 2.4);
+			return;
+		}
+		// horizontal panning of the whole strip: shift+wheel or trackpad deltaX
+		const strip = lastStrip;
+		const horizontal = e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY);
+		if (strip && !strip.fits && horizontal) {
+			e.preventDefault();
+			const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+			panInst = clamp(panInst + delta, strip.minPan, strip.maxPan);
 			return;
 		}
 		const geo = layout();
@@ -770,6 +892,21 @@ export function createRenderer(
 		const rect = canvas.getBoundingClientRect();
 		const cx = e.clientX - rect.left;
 		const cy = e.clientY - rect.top;
+		if (drag) {
+			const dx = e.clientX - drag.startX;
+			if (Math.abs(dx) > 2) drag.moved = true;
+			const strip = lastStrip;
+			if (strip && !strip.fits) {
+				if (drag.mode === 'thumb') {
+					const thumbRange = Math.max(1, strip.trackW - strip.thumbW);
+					const panRange = strip.maxPan - strip.minPan;
+					panInst = clamp(drag.startPan - dx * (panRange / thumbRange), strip.minPan, strip.maxPan);
+				} else {
+					panInst = clamp(drag.startPan + dx, strip.minPan, strip.maxPan);
+				}
+			}
+			return;
+		}
 		const hit = hitTest(cx, cy);
 		const uid = hit ? hit.item.uid : null;
 		const plus = hit ? plusHit(cx, cy, hit) : false;
@@ -781,7 +918,45 @@ export function createRenderer(
 		}
 	}
 
+	function onDown(e: MouseEvent): void {
+		if (e.button !== 0) return;
+		const rect = canvas.getBoundingClientRect();
+		const cx = e.clientX - rect.left;
+		const cy = e.clientY - rect.top;
+		const strip = lastStrip;
+		if (strip && !strip.fits && strip.maxPan > strip.minPan) {
+			const y = cssH - HSCROLL_BOTTOM;
+			if (cy >= y - 6 && cy <= y + HSCROLL_H + 6 && cx >= strip.trackX && cx <= strip.trackX + strip.trackW) {
+				const t = clamp((cx - strip.trackX) / strip.trackW, 0, 1);
+				panInst = clamp(strip.maxPan - t * (strip.maxPan - strip.minPan), strip.minPan, strip.maxPan);
+				drag = { mode: 'thumb', startX: e.clientX, startPan: panInst, moved: false };
+				e.preventDefault();
+				return;
+			}
+		}
+		// dragging the empty background pans the strip horizontally
+		if (hitTest(cx, cy)) return;
+		if (!strip || strip.fits || strip.maxPan <= strip.minPan) return;
+		drag = { mode: 'pan', startX: e.clientX, startPan: panInst, moved: false };
+		e.preventDefault();
+	}
+
+	function onUp(): void {
+		if (!drag) return;
+		if (drag.moved) {
+			suppressClick = true;
+			// clear after the click that follows mouseup, so a drag ending
+			// outside the canvas can never swallow a later real click
+			setTimeout(() => (suppressClick = false), 0);
+		}
+		drag = null;
+	}
+
 	function onClick(e: MouseEvent): void {
+		if (suppressClick) {
+			suppressClick = false;
+			return;
+		}
 		const rect = canvas.getBoundingClientRect();
 		const cx = e.clientX - rect.left;
 		const cy = e.clientY - rect.top;
@@ -796,7 +971,9 @@ export function createRenderer(
 
 	canvas.addEventListener('wheel', onWheel, { passive: false });
 	canvas.addEventListener('mousemove', onMove);
+	canvas.addEventListener('mousedown', onDown);
 	canvas.addEventListener('click', onClick);
+	window.addEventListener('mouseup', onUp);
 
 	return {
 		setData,
@@ -815,6 +992,8 @@ export function createRenderer(
 			focusUid = null;
 		},
 		hitTest,
-		debugHopCount: () => lastHopCount
+		debugHopCount: () => lastHopCount,
+		debugStrip: () =>
+			lastStrip ? { ...lastStrip, pan: panInst, panSmooth } : null
 	};
 }

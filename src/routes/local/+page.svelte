@@ -4,7 +4,9 @@
 	import type { SgNode } from '$lib/graph/schema';
 	import {
 		buildGraphIndex,
+		clampDepth,
 		columnsState,
+		DEFAULT_DEPTH,
 		DEFAULT_OPTIONS,
 		DISPATCH_MODES,
 		expand,
@@ -23,10 +25,15 @@
 	import ShortcutHelp from '$lib/components/ShortcutHelp.svelte';
 
 	const DEFAULT_CENTER = 'src/lib/components/areas/CodeArea.svelte:86';
+	const DEPTH_STORE_KEY = 'gpen.scip.local.depth';
 	const DEFAULT_STATUS =
-		'click a node to re-center · shift-click / ⊕ / “multi” to add or remove from focus · ctrl+wheel zooms · wheel scrolls a column · right-click / j jumps';
+		'click a node to re-center · shift-click / ⊕ / “multi” to add or remove from focus · ctrl+wheel zooms · wheel scrolls a column · shift+wheel / drag pans · right-click / j jumps';
 
 	type LocalCounts = {
+		/** nodes per caller level, index 0 = L1 (nearest the centre) */
+		left: number[];
+		/** nodes per callee level, index 0 = R1 */
+		right: number[];
 		left1: number;
 		left2: number;
 		right1: number;
@@ -42,15 +49,19 @@
 			center: string[];
 			left: string[];
 			right: string[];
+			leftLevels: string[][];
+			rightLevels: string[][];
 			left1: string[];
 			left2: string[];
 			right1: string[];
 			right2: string[];
+			depth: number;
 			sort: SortMode;
 			options: LocalOptions;
 			counts: LocalCounts;
 		};
 		setSort(mode: string): boolean;
+		setDepth(depth: number): boolean;
 		toggle(name: string): boolean;
 		reveal(target: string): boolean;
 		focus(): FocusInfo | null;
@@ -87,9 +98,13 @@
 
 	let centerIds = $state<string[]>([]);
 	let options = $state<LocalOptions>({ ...DEFAULT_OPTIONS });
+	let depth = $state(DEFAULT_DEPTH);
+	let depthInput = $state(String(DEFAULT_DEPTH));
 	let columns = $state.raw<LocalColumn[]>([]);
 	let edges = $state.raw<LocalLink[]>([]);
 	let counts = $state<LocalCounts>({
+		left: [],
+		right: [],
 		left1: 0,
 		left2: 0,
 		right1: 0,
@@ -114,6 +129,10 @@
 	const chips = $derived(
 		centerIds.map((id) => ({ id, node: graph ? (graph.nodesById.get(id) ?? null) : null }))
 	);
+
+	const sum = (arr: number[]): number => arr.reduce((a, b) => a + b, 0);
+	const levelBreakdown = (levels: number[], prefix: string): string =>
+		levels.map((n, i) => `${prefix}${i + 1} ${n}`).join('/');
 
 	function validIds(ids: readonly string[]): string[] {
 		if (!graph) return [];
@@ -170,6 +189,8 @@
 		let unreachable = 0;
 		for (const c of columns) for (const i of c.items) if (i.unreachable) unreachable++;
 		counts = {
+			left: s.leftLevels.map((l) => l.length),
+			right: s.rightLevels.map((l) => l.length),
 			left1: s.left1.length,
 			left2: s.left2.length,
 			right1: s.right1.length,
@@ -182,7 +203,7 @@
 
 	function rebuild(keepScroll = false): void {
 		if (!graph) return;
-		const res = expand(graph, centerIds, options);
+		const res = expand(graph, centerIds, options, depth);
 		columns = sortColumns(res.columns, options);
 		edges = res.edges;
 		if (!keepScroll) renderer?.resetScroll();
@@ -214,6 +235,46 @@
 		options.sort = mode as SortMode;
 		rebuild(true);
 		return true;
+	}
+
+	function readStoredDepth(): number {
+		try {
+			const raw = localStorage.getItem(DEPTH_STORE_KEY);
+			if (raw != null) return clampDepth(raw);
+		} catch {
+			/* storage may be unavailable */
+		}
+		return DEFAULT_DEPTH;
+	}
+
+	function setDepth(n: unknown, persist = true): boolean {
+		const next = clampDepth(n);
+		depth = next;
+		depthInput = String(next);
+		if (persist) {
+			try {
+				localStorage.setItem(DEPTH_STORE_KEY, String(next));
+			} catch {
+				/* storage may be unavailable */
+			}
+		}
+		rebuild();
+		return true;
+	}
+
+	// Live-apply only sane values while typing; blur normalises the field.
+	function onDepthInput(e: Event): void {
+		const raw = (e.currentTarget as HTMLInputElement).value;
+		depthInput = raw;
+		const parsed = Number(raw);
+		if (Number.isFinite(parsed) && parsed >= 1) {
+			depth = clampDepth(parsed);
+			rebuild();
+		}
+	}
+
+	function onDepthBlur(): void {
+		setDepth(depthInput, true);
 	}
 
 	const OPTION_ALIASES: Record<string, keyof LocalOptions | 'dispatch' | 'sort'> = {
@@ -498,6 +559,8 @@
 		window.addEventListener('scip-graph:focus', onFocusEvent);
 
 		centerIds = resolveInitialCenter();
+		depth = readStoredDepth();
+		depthInput = String(depth);
 		rebuild();
 		updateStatusDefault();
 		renderer.start();
@@ -510,6 +573,7 @@
 				return setCenter(Array.isArray(ids) ? ids : [ids]);
 			},
 			setSort,
+			setDepth,
 			toggle,
 			reveal,
 			focus() {
@@ -544,6 +608,7 @@
 				return {
 					center: [...centerIds],
 					...columnsState(columns),
+					depth,
 					sort: options.sort,
 					options: { ...options },
 					counts: { ...counts }
@@ -632,6 +697,20 @@
 		</label>
 
 		<label class="group">
+			<span class="lbl">depth</span>
+			<input
+				class="depthInput"
+				type="number"
+				min="1"
+				step="1"
+				value={depthInput}
+				oninput={onDepthInput}
+				onblur={onDepthBlur}
+				title="caller/callee levels to expand (integer ≥ 1)"
+			/>
+		</label>
+
+		<label class="group">
 			<span class="lbl">dispatch</span>
 			<select
 				class="sel"
@@ -714,8 +793,8 @@
 
 	<footer class="foot">
 		<span class="counts">
-			focus {centerIds.length} · callers {counts.left1 + counts.left2} (L1 {counts.left1}/L2 {counts.left2}) ·
-			callees {counts.right1 + counts.right2} (R1 {counts.right1}/R2 {counts.right2}) · edges {counts.edges}{counts.invalid
+			focus {centerIds.length} · depth {depth} · callers {sum(counts.left)} (L {levelBreakdown(counts.left, 'L')}) ·
+			callees {sum(counts.right)} (R {levelBreakdown(counts.right, 'R')}) · edges {counts.edges}{counts.invalid
 				? ` (${counts.invalid} filtered)`
 				: ''}{counts.unreachable ? ` · ${counts.unreachable} unreachable` : ''}
 		</span>
@@ -733,231 +812,72 @@
 
 <style>
 	.local-app {
-		display: grid;
-		grid-template-rows: auto 1fr auto;
-		height: calc(100dvh - 8rem);
-		min-height: 360px;
-		margin: -1.25rem;
-		background: #0e1116;
-		color: #d9e2ee;
-		font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-		overflow: hidden;
+		display: grid; grid-template-rows: auto 1fr auto; height: calc(100dvh - 8rem); min-height: 360px;
+		margin: -1.25rem; background: #0e1116; color: #d9e2ee;
+		font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; overflow: hidden;
 	}
-
 	.bar {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.6ch 1.4ch;
-		padding: 0.6lh 1.2ch;
-		background: #141a22;
-		border-bottom: 1px solid #232c38;
+		display: flex; flex-wrap: wrap; align-items: center; gap: 0.6ch 1.4ch;
+		padding: 0.6lh 1.2ch; background: #141a22; border-bottom: 1px solid #232c38;
 	}
-
-	.title {
-		color: #b98cff;
-		letter-spacing: 0.02em;
-	}
-
+	.title { color: #b98cff; letter-spacing: 0.02em; }
 	.back {
-		color: #7eaeec;
-		text-decoration: none;
-		border: 1px solid #232c38;
-		border-radius: 5px;
+		color: #7eaeec; text-decoration: none; border: 1px solid #232c38; border-radius: 5px;
 		padding: 0.2lh 0.8ch;
 	}
-
-	.back:hover {
-		border-color: #7eaeec;
+	.back:hover { border-color: #7eaeec; }
+	.group { display: inline-flex; align-items: center; gap: 0.6ch; }
+	.lbl { color: #8493a8; text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em; }
+	.chk { color: #8493a8; white-space: nowrap; }
+	.chk input { accent-color: #b98cff; }
+	.sel, .addInput, .depthInput, .btn {
+		background: #0f141b; color: #d9e2ee; border: 1px solid #232c38; border-radius: 5px;
+		padding: 0.25lh 0.8ch; font: inherit;
 	}
-
-	.group {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.6ch;
-	}
-
-	.lbl {
-		color: #8493a8;
-		text-transform: uppercase;
-		font-size: 10px;
-		letter-spacing: 0.08em;
-	}
-
-	.chk {
-		color: #8493a8;
-		white-space: nowrap;
-	}
-
-	.chk input {
-		accent-color: #b98cff;
-	}
-
-	.sel,
-	.addInput,
-	.btn {
-		background: #0f141b;
-		color: #d9e2ee;
-		border: 1px solid #232c38;
-		border-radius: 5px;
-		padding: 0.25lh 0.8ch;
-		font: inherit;
-	}
-
-	.addInput {
-		width: 34ch;
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 12px;
-	}
-
-	.btn {
-		cursor: pointer;
-	}
-
-	.btn:hover {
-		border-color: #b98cff;
-		color: #fff;
-	}
-
-	.chips {
-		display: inline-flex;
-		flex-wrap: wrap;
-		gap: 0.5ch;
-	}
-
+	.addInput { width: 34ch; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+	.depthInput { width: 6ch; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+	.btn { cursor: pointer; }
+	.btn:hover { border-color: #b98cff; color: #fff; }
+	.chips { display: inline-flex; flex-wrap: wrap; gap: 0.5ch; }
 	.chip {
-		display: inline-flex;
-		align-items: center;
-		background: rgba(185, 140, 255, 0.14);
-		border: 1px solid rgba(185, 140, 255, 0.4);
-		border-radius: 999px;
-		overflow: hidden;
+		display: inline-flex; align-items: center; background: rgba(185, 140, 255, 0.14);
+		border: 1px solid rgba(185, 140, 255, 0.4); border-radius: 999px; overflow: hidden;
 	}
-
-	.chipName,
-	.chipX {
-		background: none;
-		border: none;
-		color: #e2d5ff;
-		font: inherit;
-		cursor: pointer;
+	.chipName, .chipX {
+		background: none; border: none; color: #e2d5ff; font: inherit; cursor: pointer;
 		padding: 0.15lh 0.7ch;
 	}
-
-	.chipName:hover {
-		background: rgba(185, 140, 255, 0.2);
-	}
-
-	.chipX {
-		border-left: 1px solid rgba(185, 140, 255, 0.3);
-		color: #ffb4c8;
-	}
-
-	.chipX:disabled {
-		opacity: 0.3;
-		cursor: default;
-	}
-
-	.stageWrap {
-		position: relative;
-		min-height: 0;
-	}
-
-	canvas {
-		display: block;
-		width: 100%;
-		height: 100%;
-	}
-
+	.chipName:hover { background: rgba(185, 140, 255, 0.2); }
+	.chipX { border-left: 1px solid rgba(185, 140, 255, 0.3); color: #ffb4c8; }
+	.chipX:disabled { opacity: 0.3; cursor: default; }
+	.stageWrap { position: relative; min-height: 0; }
+	canvas { display: block; width: 100%; height: 100%; }
 	.legend {
-		position: absolute;
-		left: 1.5ch;
-		bottom: 1lh;
-		display: flex;
-		gap: 1.5ch;
-		color: #8493a8;
-		font-size: 11px;
-		pointer-events: none;
+		position: absolute; left: 1.5ch; bottom: 1lh; display: flex; gap: 1.5ch;
+		color: #8493a8; font-size: 11px; pointer-events: none;
 	}
-
-	.legend span {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.5ch;
-	}
-
-	.sw {
-		width: 14px;
-		height: 3px;
-		border-radius: 2px;
-		display: inline-block;
-	}
-
-	.sw.static {
-		background: #7eaeec;
-	}
-
-	.sw.virtual {
-		background: #f0b25c;
-	}
-
-	.sw.self {
-		background: #88dca4;
-	}
-
-	.sw.faded {
-		background: linear-gradient(90deg, transparent, #7eaeec);
-	}
-
+	.legend span { display: inline-flex; align-items: center; gap: 0.5ch; }
+	.sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+	.sw.static { background: #7eaeec; }
+	.sw.virtual { background: #f0b25c; }
+	.sw.self { background: #88dca4; }
+	.sw.faded { background: linear-gradient(90deg, transparent, #7eaeec); }
 	.foot {
-		display: flex;
-		gap: 2ch;
-		align-items: baseline;
-		padding: 0.5lh 1.2ch;
-		background: #141a22;
-		border-top: 1px solid #232c38;
-		font-size: 12px;
-		white-space: nowrap;
+		display: flex; gap: 2ch; align-items: baseline; padding: 0.5lh 1.2ch;
+		background: #141a22; border-top: 1px solid #232c38; font-size: 12px; white-space: nowrap;
 		overflow: hidden;
 	}
-
-	.counts {
-		color: #8493a8;
-		flex: 0 0 auto;
-	}
-
+	.counts { color: #8493a8; flex: 0 0 auto; }
 	.status {
-		color: #aebcd0;
-		overflow: hidden;
-		text-overflow: ellipsis;
+		color: #aebcd0; overflow: hidden; text-overflow: ellipsis;
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 	}
-
-	.empty {
-		color: #8493a8;
-		padding: 1.5rem;
-	}
-
-	.empty code {
-		background: #0f141b;
-		padding: 0.1rem 0.35rem;
-		border-radius: 4px;
-	}
-
+	.empty { color: #8493a8; padding: 1.5rem; }
+	.empty code { background: #0f141b; padding: 0.1rem 0.35rem; border-radius: 4px; }
 	.toast {
-		position: absolute;
-		right: 1.6ch;
-		bottom: 5.5lh;
-		max-width: 62ch;
-		padding: 0.5lh 1.2ch;
-		background: rgba(20, 26, 34, 0.96);
-		border: 1px solid #b98cff;
-		border-radius: 7px;
-		color: #e2d5ff;
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 12px;
-		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-		z-index: 20;
-		pointer-events: none;
+		position: absolute; right: 1.6ch; bottom: 5.5lh; max-width: 62ch; padding: 0.5lh 1.2ch;
+		background: rgba(20, 26, 34, 0.96); border: 1px solid #b98cff; border-radius: 7px;
+		color: #e2d5ff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); z-index: 20; pointer-events: none;
 	}
 </style>
