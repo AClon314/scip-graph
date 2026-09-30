@@ -1,8 +1,23 @@
 <script lang="ts">
 	import favicon from '$lib/assets/favicon.svg';
+	import { onNavigate } from '$app/navigation';
 	import { page } from '$app/state';
 
 	let { children } = $props();
+
+	// A↔B (Global↔Local) crossfade via the View Transitions API. SvelteKit keeps
+	// the old page mounted until `navigation.complete`, so awaiting it inside the
+	// transition callback lets the browser snapshot and crossfade both trees.
+	// Browsers without the API just navigate normally.
+	onNavigate((navigation) => {
+		if (typeof document === 'undefined' || !document.startViewTransition) return;
+		return new Promise<void>((resolve) => {
+			document.startViewTransition(async () => {
+				resolve();
+				await navigation.complete;
+			});
+		});
+	});
 </script>
 
 <svelte:head>
@@ -64,5 +79,19 @@
 
 	main {
 		padding: 1.25rem;
+	}
+
+	/* Keep the page-to-page crossfade quick and smooth. */
+	:global(::view-transition-old(root)),
+	:global(::view-transition-new(root)) {
+		animation-duration: 260ms;
+		animation-timing-function: ease;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		:global(::view-transition-old(root)),
+		:global(::view-transition-new(root)) {
+			animation-duration: 1ms;
+		}
 	}
 </style>
