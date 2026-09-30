@@ -10,6 +10,32 @@ import type { AggNode, Aggregation, Level } from './aggregate';
 import { edgeScreenWidth, nodeFill } from './colors';
 import { worldToScreen, type View } from './geometry';
 
+/**
+ * Filled arrowhead with its tip at `(x, y)`, pointing along the unit vector
+ * `(ux, uy)`. The caller is responsible for `fillStyle`/`globalAlpha`;
+ * `fillStyle` is inherited from the current stroke so the head fades and
+ * colours exactly like its edge. Scalar-only: no allocations.
+ */
+function drawArrowHead(
+	ctx: CanvasRenderingContext2D,
+	x: number,
+	y: number,
+	ux: number,
+	uy: number,
+	size: number
+): void {
+	const px = -uy;
+	const py = ux;
+	const base = size * 0.55;
+	ctx.fillStyle = ctx.strokeStyle;
+	ctx.beginPath();
+	ctx.moveTo(x, y);
+	ctx.lineTo(x - ux * size + px * base, y - uy * size + py * base);
+	ctx.lineTo(x - ux * size - px * base, y - uy * size - py * base);
+	ctx.closePath();
+	ctx.fill();
+}
+
 export type Scene = {
 	agg: Aggregation | null;
 	nodeById: ReadonlyMap<string, AggNode>;
@@ -37,12 +63,21 @@ export function drawScene(
 
 	// edges
 	ctx.lineCap = 'round';
+	const tx = view.tx;
+	const ty = view.ty;
 	for (const edge of agg.edges) {
 		const a = nodeById.get(edge.source);
 		const b = nodeById.get(edge.target);
 		if (!a || !b) continue;
-		const [ax, ay] = worldToScreen(view, a.x ?? 0, a.y ?? 0);
-		const [bx, by] = worldToScreen(view, b.x ?? 0, b.y ?? 0);
+		// Inline worldToScreen (scalar only) so the ~2000-edge symbol loop does
+		// not allocate a tuple per endpoint.
+		const ax = (a.x ?? 0) * k + tx;
+		const ay = (a.y ?? 0) * k + ty;
+		const bx = (b.x ?? 0) * k + tx;
+		const by = (b.y ?? 0) * k + ty;
+		const dx = bx - ax;
+		const dy = by - ay;
+		const dist = Math.hypot(dx, dy);
 		const active =
 			selection.size > 0 && (selection.has(edge.source) || selection.has(edge.target));
 		const dim =
@@ -50,11 +85,38 @@ export function drawScene(
 		if (edge.dispatch === 'virtual') ctx.strokeStyle = active ? '#ffb347' : '#7a5a2a';
 		else ctx.strokeStyle = active ? '#8fbcd4' : '#42505f';
 		ctx.globalAlpha = dim ? 0.05 : active ? 0.95 : 0.5;
-		ctx.lineWidth = edgeScreenWidth(edge.calls);
+		const lw = edgeScreenWidth(edge.calls);
+		ctx.lineWidth = lw;
+
+		// Trim the target end back to its drawn rect so the arrowhead tip lands on
+		// the border instead of under (or past) the node. Overlapping rects, or a
+		// segment too short to read, keep the raw line and drop the head.
+		let ex = bx;
+		let ey = by;
+		let arrow = false;
+		if (dist > 1e-3) {
+			const overlap =
+				Math.abs(dx) < (a.hw + b.hw) * k && Math.abs(dy) < (a.hh + b.hh) * k;
+			if (!overlap) {
+				const m = Math.min(
+					dx === 0 ? Infinity : (b.hw * k) / Math.abs(dx),
+					dy === 0 ? Infinity : (b.hh * k) / Math.abs(dy)
+				);
+				if (m < 1) {
+					ex = bx - dx * m;
+					ey = by - dy * m;
+					arrow = dist * (1 - m) >= 10;
+				}
+			}
+		}
 		ctx.beginPath();
 		ctx.moveTo(ax, ay);
-		ctx.lineTo(bx, by);
+		ctx.lineTo(ex, ey);
 		ctx.stroke();
+		if (arrow) {
+			const size = Math.min(11, Math.max(5, 3 + lw * 1.7));
+			drawArrowHead(ctx, ex, ey, dx / dist, dy / dist, size);
+		}
 	}
 	ctx.globalAlpha = 1;
 
