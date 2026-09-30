@@ -55,6 +55,27 @@ environment variable.
 bun run derive --help
 ```
 
+## Query CLI
+
+The former `scip-graph-query.mjs` CLI now lives in this repo as strict
+TypeScript under `src/lib/query/`, with the thin entrypoint
+`src/bin/scip-graph.ts` (`bun run scip-graph`). It answers `callers` /
+`callees` / `impact` (reachability), `refs` (call sites) and `boundaries`
+(unresolved callees, read from the fork SCIP index). It reads
+`static/graph.json` by default (`--graph` overrides); `boundaries` reads
+`rules/out/.cache/scip/index-fork.json` by default (`--index` overrides).
+
+```sh
+bun run scip-graph -- callers "src/lib/components/areas/CodeArea.svelte:86" --json
+bun run scip-graph -- refs "src/lib/components/areas/CodeArea.svelte:86"
+bun run scip-graph -- impact "src/lib/components/areas/CodeArea.svelte:86" --depth 2 --format mermaid
+bun run scip-graph -- boundaries --symbol '$state' --json
+```
+
+See [`docs/query-cli.md`](docs/query-cli.md) for selectors, the `--json`
+contracts and exit codes, and [`docs/query-verification.md`](docs/query-verification.md)
+for a verified transcript. Historical scip PoC docs live in [`docs/`](docs/README.md).
+
 ## Checks
 
 ```sh
@@ -67,8 +88,12 @@ bun run build   # production build
 ```
 scripts/derive-graph.ts        # SCIP JSON index -> graph JSON (CLI)
 src/lib/graph/schema.ts        # frozen graph types
+src/lib/query/                 # scip-graph query library (select/reach/refs/boundaries/export)
+src/bin/scip-graph.ts          # thin query CLI entrypoint
 src/lib/server/loadGraph.ts    # server-side graph loader (SCIP_GRAPH_FILE)
 src/routes/+layout.svelte      # nav: Global / Local
-src/routes/global/             # placeholder global view
-src/routes/local/              # placeholder local (butterfly) view
+src/routes/global/             # global view
+src/routes/local/              # local (butterfly) view
+docs/                          # query CLI docs + historical scip PoCs
+test/query.test.ts             # bun test for the query library
 ```
