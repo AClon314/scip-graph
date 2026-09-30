@@ -30,6 +30,7 @@ import { isElkStressLayout, type ElkStressLayout } from '../src/lib/global/elk-s
 import { computeMetrics } from '../src/lib/global/metrics';
 import { countOverlaps, separateRects, type RectNode } from '../src/lib/global/rect-separation';
 import type { SgGraph } from '../src/lib/graph/schema';
+import { Progress } from './progress';
 
 const DEFAULT_GRAPH = 'static/graph.json';
 const DEFAULT_OUT = 'static/elk-stress-symbol.json';
@@ -182,10 +183,15 @@ export async function runCli(argv: string[]): Promise<number> {
   process.stdout.write(
     `[precompute:elk] ${children.length} symbol nodes, ${edges.length} edges; running ELK stress…\n`,
   );
+  const progress = new Progress({ label: 'precompute:elk' });
+  progress.set('nodes', children.length);
+  progress.set('edges', edges.length);
+  progress.section('elk-stress');
   const elk = createElk();
   const t0 = performance.now();
   const layout = await elk.layout(elkGraph);
   const elkMs = performance.now() - t0;
+  progress.set('elk', `${elkMs.toFixed(0)}ms`);
 
   const placed: PlacedNode[] = (layout.children ?? []).map((child) => {
     const w = child.width ?? 0;
@@ -210,11 +216,16 @@ export async function runCli(argv: string[]): Promise<number> {
   const MAX_CLEANUP_PASSES = 20000;
   let cleanupPasses = 0;
   let overlaps = countOverlaps(placed);
+  progress.section('cleanup', 'pass');
+  progress.set('overlap', overlaps);
   while (overlaps > 0 && cleanupPasses < MAX_CLEANUP_PASSES) {
     cleanupPasses += separateRects(placed, 500);
     overlaps = countOverlaps(placed);
+    progress.tick(cleanupPasses, 0);
+    progress.set('overlap', overlaps);
   }
   const cleanupMs = performance.now() - t1;
+  progress.done();
   assertNoOverlap(placed, 'elk-stress');
 
   const out: ElkStressLayout = {
