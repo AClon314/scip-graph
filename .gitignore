@@ -9,6 +9,7 @@ node_modules
 /build
 /static/graph.json
 /static/elk-stress-symbol.json
+/static/d3force-symbol.json
 
 # OS
 .DS_Store

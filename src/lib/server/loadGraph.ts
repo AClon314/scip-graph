@@ -7,6 +7,11 @@ import {
   isElkStressLayout,
   type ElkStressLayout,
 } from '$lib/global/elk-stress';
+import {
+  FORCE_SYMBOL_FILE,
+  isForceLayout,
+  type ForceLayout,
+} from '$lib/global/force-cache';
 
 /** Default location when `SCIP_GRAPH_FILE` is not set. */
 export const DEFAULT_GRAPH_FILE = 'static/graph.json';
@@ -50,6 +55,30 @@ export async function loadElkStress(): Promise<ElkStressLayout | null> {
   const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
   if (!isElkStressLayout(parsed)) {
     throw new Error(`Invalid precomputed ELK stress layout: ${file}`);
+  }
+  return parsed;
+}
+
+/** Absolute path of the precomputed d3-force layout (env override supported). */
+export function resolveForceFile(): string {
+  const configured = process.env.SCIP_GRAPH_FORCE_FILE?.trim();
+  return resolve(
+    process.cwd(),
+    configured && configured.length > 0 ? configured : FORCE_SYMBOL_FILE,
+  );
+}
+
+/**
+ * Sibling loader for the precomputed `d3-force` symbol layout.
+ * Returns `null` when the file has not been generated yet (`bun run
+ * precompute:force`), which makes the global view fall back to the live worker.
+ */
+export async function loadForce(): Promise<ForceLayout | null> {
+  const file = resolveForceFile();
+  if (!existsSync(file)) return null;
+  const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
+  if (!isForceLayout(parsed)) {
+    throw new Error(`Invalid precomputed d3-force layout: ${file}`);
   }
   return parsed;
 }
