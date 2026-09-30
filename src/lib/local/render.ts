@@ -815,15 +815,6 @@ export function createRenderer(
 			focusUid = null;
 		},
 		hitTest,
-		debugHopCount: () => lastHopCount,
-		debugBoxes: () =>
-			layout().flatMap((g) =>
-				g.boxes.map((b) => ({ uid: b.it.uid, id: b.it.id, column: g.col.key, x: b.x, y: b.y, w: b.w, h: b.h }))
-			),
-		geometry: () => lastGeo.map((g) => ({ key: g.col.key, x: g.x, w: g.w, n: g.col.items.length })),
-		zoomTo(z: number): void {
-			zoomTarget = clamp(z, 0.32, 2.4);
-		},
-		getZoom: () => zoom
+		debugHopCount: () => lastHopCount
 	};
 }

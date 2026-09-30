@@ -27,20 +27,12 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import {
-  forceCenter,
-  forceCollide,
-  forceLink,
-  forceManyBody,
-  forceSimulation,
-  type SimulationLinkDatum,
-  type SimulationNodeDatum,
-} from 'd3-force';
 import { aggregate } from '../src/lib/global/aggregate';
+import { buildSimulation } from '../src/lib/global/force-sim';
+import type { LayoutParams } from '../src/lib/global/force-sim';
 import { isForceLayout, type ForceLayout } from '../src/lib/global/force-cache';
-import type { LayoutParams } from '../src/lib/global/layout.worker';
 import { computeMetrics } from '../src/lib/global/metrics';
-import { countOverlaps, radiusOf, separateRects, type RectNode } from '../src/lib/global/rect-separation';
+import { countOverlaps, separateRects, type RectNode } from '../src/lib/global/rect-separation';
 import type { SgGraph } from '../src/lib/graph/schema';
 import { Progress } from './progress';
 
@@ -128,96 +120,11 @@ function parseArgs(argv: string[]): CliOptions {
 /** Node with centre + half-extents, plus the symbol id used to key positions. */
 type PlacedNode = RectNode & { id: string };
 
-/** Node datum used by the simulation (position + drawn half-extents). */
-interface SimNode extends SimulationNodeDatum {
-  id: string;
-  hw: number;
-  hh: number;
-  radius: number;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-}
-
-interface SimLink extends SimulationLinkDatum<SimNode> {
-  calls: number;
-}
-
-/** Deterministic PRNG (same as `layout.worker.ts`). */
-function mulberry32(a: number): () => number {
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 function assertNoOverlap(nodes: readonly PlacedNode[], label: string): void {
   const overlaps = countOverlaps(nodes);
   if (overlaps !== 0) {
     throw new Error(`${label}: ${overlaps} overlapping rect pairs after cleanup`);
   }
-}
-
-/**
- * Build + configure the simulation exactly like `layout.worker.ts` does for the
- * symbol level (seeded phyllotaxis start, then link / charge / collide / center).
- */
-function buildSimulation(
-  agg: ReturnType<typeof aggregate>,
-  params: LayoutParams,
-  seed: number,
-): { sim: ReturnType<typeof forceSimulation<SimNode>>; simNodes: SimNode[] } {
-  const rnd = mulberry32(seed);
-  const simNodes: SimNode[] = agg.nodes.map((meta, i) => {
-    const angle = i * Math.PI * (3 - Math.sqrt(5));
-    const radius = 12 * Math.sqrt(0.5 + i);
-    return {
-      id: meta.id,
-      index: i,
-      hw: meta.hw,
-      hh: meta.hh,
-      radius: radiusOf(meta),
-      x: radius * Math.cos(angle) + (rnd() - 0.5) * 4,
-      y: radius * Math.sin(angle) + (rnd() - 0.5) * 4,
-      vx: 0,
-      vy: 0,
-    };
-  });
-  const byId = new Map(simNodes.map((node) => [node.id, node]));
-  const links: SimLink[] = agg.edges.map((edge) => ({
-    source: byId.get(edge.source) as SimNode,
-    target: byId.get(edge.target) as SimNode,
-    calls: edge.calls,
-  }));
-
-  const sim = forceSimulation<SimNode>(simNodes)
-    .force(
-      'link',
-      forceLink<SimNode, SimLink>(links)
-        .id((d) => d.id)
-        .distance(params.linkDistance ?? 80)
-        .strength(params.linkStrength ?? 0.15),
-    )
-    .force(
-      'charge',
-      forceManyBody<SimNode>()
-        .strength(params.charge ?? -40)
-        .distanceMax(params.chargeDistanceMax ?? 600),
-    )
-    .force(
-      'collide',
-      forceCollide<SimNode>((d) => d.radius)
-        .strength(params.collideStrength ?? 1)
-        .iterations(params.collideIterations ?? 4),
-    )
-    .force('center', forceCenter<SimNode>(0, 0))
-    .stop();
-
-  return { sim, simNodes };
 }
 
 function checkFile(outFile: string): number {
@@ -268,7 +175,7 @@ export async function runCli(argv: string[]): Promise<number> {
   progress.set('edges', agg.edges.length);
 
   const t0 = performance.now();
-  const { sim, simNodes } = buildSimulation(agg, SYMBOL_PARAMS, options.seed);
+  const { sim, simNodes } = buildSimulation(agg.nodes, agg.edges, SYMBOL_PARAMS, options.seed);
 
   progress.section('d3-force', 'tick');
   const CHUNK = 10;

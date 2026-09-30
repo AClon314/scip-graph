@@ -29,9 +29,6 @@ export type JumpRequest = {
 /** Event name emitted on `window` for any editor transport to consume. */
 export const JUMP_EVENT = 'scip-graph:jump';
 
-/** Event name an editor can dispatch to reveal/highlight a node. */
-export const FOCUS_EVENT = 'scip-graph:focus';
-
 /** Resolve a node into a jump request without side effects. */
 export function resolveJump(node: SgNode): JumpRequest {
 	const range: SgRange | undefined = node.range;

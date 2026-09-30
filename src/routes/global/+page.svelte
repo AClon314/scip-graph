@@ -3,13 +3,22 @@
 	 * Global density view — Svelte 5 / TS port of
 	 * `tmp/scip-graph-viewer/view-a/app.js`.
 	 *
-	 * The main thread only aggregates levels, renders to canvas and handles
+	 * The main thread aggregates levels, renders to canvas and handles
 	 * pan/zoom/search/box-select. d3-force runs inside `layout.worker.ts`.
+	 *
+	 * The heavy lifting now lives in focused modules: canvas rendering
+	 * (`$lib/global/render`), geometry (`$lib/global/geometry`), the layout
+	 * worker + precomputed-layout helpers (`$lib/global/layout`), the Global→Local
+	 * handoff (`$lib/global/handoff`), arrow-key navigation (`$lib/global/keyboard`)
+	 * and the pointer/pinch gesture machine (`$lib/global/pointer`). The toolbar
+	 * and shortcut overlay are components under `$lib/components`.
 	 */
 	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type { SgGraph } from '$lib/graph/schema';
 	import OutlineTree from '$lib/components/OutlineTree.svelte';
+	import GlobalToolbar from '$lib/components/GlobalToolbar.svelte';
+	import GlobalHelp from '$lib/components/GlobalHelp.svelte';
 	import {
 		aggregate,
 		LEVELS,
@@ -17,15 +26,51 @@
 		type Aggregation,
 		type Level
 	} from '$lib/global/aggregate';
-	import { computeMetrics, rectOf } from '$lib/global/metrics';
-	import type {
-		LayoutParams,
-		LayoutRequest,
-		LayoutResponse
-	} from '$lib/global/layout.worker';
-	import type { ElkStressLayout, ElkStressPosition } from '$lib/global/elk-stress';
-	import type { ForceLayout, ForcePosition } from '$lib/global/force-cache';
+	import type { ElkStressLayout } from '$lib/global/elk-stress';
+	import type { ForceLayout } from '$lib/global/force-cache';
 	import { jumpToSource } from '$lib/global/jump';
+	import {
+		TICKS,
+		PARAMS,
+		createLayoutWorker,
+		covers,
+		applyPositions,
+		applyPrecomputed,
+		type GlobalMetrics,
+		type LayoutMode,
+		type LayoutWorker,
+		type PositionMap
+	} from '$lib/global/layout';
+	import {
+		boxSelectIds,
+		computeFit,
+		hitTest,
+		selectionBounds,
+		worldToScreen,
+		zoomAround,
+		zoomToBounds,
+		type Box
+	} from '$lib/global/geometry';
+	import {
+		HANDOFF_KEY,
+		buildSymbolMaps,
+		capHandoff,
+		persistHandoff,
+		toSymbolIds,
+		type SymbolMaps
+	} from '$lib/global/handoff';
+	import {
+		isTypingTarget,
+		nearestInDirection,
+		nearestToCenter,
+		type Direction
+	} from '$lib/global/keyboard';
+	import { createPointerController } from '$lib/global/pointer';
+	import { drawScene } from '$lib/global/render';
+	import { createGlobalDebug, type GlobalDebugApi } from '$lib/global/debug';
+	import { handleSplitterDrag } from '$lib/global/splitter';
+	import { matchNodes } from '$lib/global/search';
+	import { tooltipFor, type Tooltip } from '$lib/global/tooltip';
 
 	let {
 		data
@@ -37,50 +82,9 @@
 		};
 	} = $props();
 
-	const TICKS: Record<Level, number> = { dir: 320, file: 450, symbol: 400 };
-	const PARAMS: Record<Level, LayoutParams> = {
-		dir: { linkDistance: 115, linkStrength: 0.12, charge: -70, chargeDistanceMax: 900 },
-		file: { linkDistance: 90, linkStrength: 0.14, charge: -48, chargeDistanceMax: 700 },
-		symbol: { linkDistance: 80, linkStrength: 0.15, charge: -40, chargeDistanceMax: 600 }
-	};
-	const HANDOFF_KEY = 'gpen.scip.selection';
 	const OUTLINE_WIDTH_KEY = 'gpen.scip.outlineWidth';
 	const OUTLINE_MIN_W = 200;
 	const OUTLINE_MAX_W = 760;
-	/** Pointer travel (px) below which a pointerup counts as a tap, not a pan. */
-	const TAP_SLOP = 6;
-
-	/** Live d3-force worker (default), cached d3-force, or offline ELK stress. */
-	type LayoutMode = 'd3-force' | 'elk-stress';
-
-	type GlobalMetrics = {
-		level: Level;
-		source: string;
-		nodes: number;
-		edges: number;
-		ms: number;
-		nodeOverlapRatio: number;
-		nodeOverlapPairs: number;
-		fillNet: number;
-		cleanupPasses: number;
-		overlapsBeforeCleanup: number;
-		overlapsAfterCleanup: number;
-		/** elk-stress only: wall time of the offline precompute. */
-		precomputeMs?: number;
-	};
-
-	type Tooltip = { x: number; y: number; title: string; body: string; muted?: string };
-	type Box = { x: number; y: number; w: number; h: number };
-	type DragState = {
-		mode: 'pan' | 'select';
-		startX: number;
-		startY: number;
-		moved: boolean;
-		tx: number;
-		ty: number;
-		selStart: [number, number];
-		rect?: Box;
-	};
 
 	// --- non-reactive scene state (canvas render loop) -----------------------
 	let graph = $state.raw<SgGraph | null>(null);
@@ -93,35 +97,24 @@
 	const view = { k: 1, tx: 0, ty: 0 };
 	let seed = 1;
 	let layoutToken = 0;
-	let drag: DragState | null = null;
 	let lastTooltipKey = '';
 	/** 0..1 pulse used while a selection is elevated before navigating. */
 	let elevate = 0;
 	let navigating = false;
-	/** Graph-wide symbol lookup so the Local handoff works at any level. */
-	let allSymbolIds = new Set<string>();
-	let symbolsByFile = new Map<string, string[]>();
-	let symbolsByDir = new Map<string, string[]>();
-	/** Precomputed elk-stress positions keyed by symbol id (null when absent). */
-	let elkPositions: Map<string, ElkStressPosition> | null = null;
-	/** Cached offline d3-force positions keyed by symbol id (null when absent). */
-	let forcePositions: Map<string, ForcePosition> | null = null;
-	/** Live pointers (touch + mouse) for pan / pinch disambiguation. */
-	const activePointers = new Map<number, { x: number; y: number }>();
-	let pinch:
-		| { startDist: number; startK: number; midX: number; midY: number; startTx: number; startTy: number }
-		| null = null;
-	/** Set once a gesture becomes a pinch so the trailing finger-up is not a tap. */
-	let suppressTap = false;
+	/** Symbol→file / symbol→dir index used by the Global→Local handoff. */
+	let symbolMaps: SymbolMaps = {
+		allSymbolIds: new Set(),
+		symbolsByFile: new Map(),
+		symbolsByDir: new Map()
+	};
+	/** Precomputed layouts keyed by symbol id (null when absent). */
+	let elkPositions: PositionMap | null = null;
+	let forcePositions: PositionMap | null = null;
 
 	let canvasEl: HTMLCanvasElement | undefined = $state();
 	let ctx: CanvasRenderingContext2D | null = null;
-	let worker: Worker | null = null;
-	let workerSeq = 0;
-	const pending = new Map<
-		number,
-		{ resolve: (r: LayoutResponse) => void; reject: (e: unknown) => void }
-	>();
+	let worker: LayoutWorker | null = null;
+	let pointer: ReturnType<typeof createPointerController> | null = null;
 
 	// --- reactive UI state ---------------------------------------------------
 	let level = $state<Level>('dir');
@@ -158,50 +151,13 @@
 		}, 2500);
 	}
 
-	function hashHue(str: string): number {
-		let h = 2166136261;
-		for (let i = 0; i < str.length; i++) {
-			h ^= str.charCodeAt(i);
-			h = Math.imul(h, 16777619);
-		}
-		return (h >>> 0) % 360;
-	}
-
-	function colorKey(node: AggNode): string {
-		if (level !== 'symbol') return node.id;
-		const file = node.id.slice(0, node.id.lastIndexOf(':'));
-		return file.split('/').slice(0, 3).join('/');
-	}
-
-	function nodeFill(node: AggNode, alpha = 1): string {
-		const hue = hashHue(colorKey(node));
-		return `hsla(${hue}, 62%, 58%, ${alpha})`;
-	}
-
-	function worldToScreen(x: number, y: number): [number, number] {
-		const { k, tx, ty } = view;
-		return [x * k + tx, y * k + ty];
-	}
-
-	// -------------------------------------------------------------------------
-	// worker
-	// -------------------------------------------------------------------------
-	function runWorker(payload: Omit<LayoutRequest, 'token'>): Promise<LayoutResponse> {
-		return new Promise((resolve, reject) => {
-			if (!worker) {
-				reject(new Error('layout worker not ready'));
-				return;
-			}
-			const token = ++workerSeq;
-			pending.set(token, { resolve, reject });
-			worker.postMessage({ token, ...payload });
-		});
-	}
-
 	// -------------------------------------------------------------------------
 	// layout
 	// -------------------------------------------------------------------------
-	async function setLevel(next: Level, { keepSelection = false } = {}): Promise<GlobalMetrics | undefined> {
+	async function setLevel(
+		next: Level,
+		{ keepSelection = false } = {}
+	): Promise<GlobalMetrics | undefined> {
 		if (!LEVELS.includes(next)) throw new Error(`unknown level ${next}`);
 		if (!keepSelection) selection.clear();
 		// elk-stress is symbol-only; any other level falls back to live d3-force.
@@ -229,9 +185,15 @@
 		const token = ++layoutToken;
 		agg = aggregate(graph, level);
 		nodeById = new Map(agg.nodes.map((n) => [n.id, n]));
-		if (layoutMode === 'elk-stress' && level === 'symbol' && elkCovers()) {
+		if (layoutMode === 'elk-stress' && level === 'symbol' && elkPositions && covers(elkPositions, agg)) {
 			// Precomputed positions: no worker round-trip, no 6 s wait.
-			applyElkPositions();
+			metrics = applyPrecomputed(
+				agg,
+				elkPositions,
+				'elk-stress',
+				data.elkStress?.cleanupPasses ?? 0,
+				data.elkStress?.ms
+			);
 			if (token !== layoutToken) return metrics ?? undefined;
 			setStatus(null);
 			fit();
@@ -244,8 +206,14 @@
 		}
 		// Cached offline d3-force symbol layout: instant, no worker. The explicit
 		// re-layout button passes `forceLive` to force a fresh worker run.
-		if (!forceLive && layoutMode === 'd3-force' && level === 'symbol' && forceCovers()) {
-			applyForcePositions();
+		if (!forceLive && layoutMode === 'd3-force' && level === 'symbol' && forcePositions && covers(forcePositions, agg)) {
+			metrics = applyPrecomputed(
+				agg,
+				forcePositions,
+				'd3-force-cache',
+				data.forcePositions?.cleanupPasses ?? 0,
+				data.forcePositions?.ms
+			);
 			if (token !== layoutToken) return metrics ?? undefined;
 			setStatus(null);
 			fit();
@@ -261,105 +229,9 @@
 		return metrics ?? undefined;
 	}
 
-	/** True when every symbol node has a matching precomputed position. */
-	function elkCovers(): boolean {
-		if (!elkPositions || !agg) return false;
-		if (elkPositions.size !== agg.nodes.length) return false;
-		for (const node of agg.nodes) if (!elkPositions.has(node.id)) return false;
-		return true;
-	}
-
-	/**
-	 * Place the current symbol aggregate from the precomputed file and re-derive
-	 * the overlap/fill metrics on the main thread (independent of the worker's
-	 * numbers) so `nodeOverlapRatio === 0` is verified, not assumed.
-	 */
-	function applyElkPositions(): void {
-		if (!agg || !elkPositions) return;
-		const t0 = performance.now();
-		for (const node of agg.nodes) {
-			const p = elkPositions.get(node.id);
-			if (p) {
-				node.x = p.x;
-				node.y = p.y;
-			}
-		}
-		const derived = computeMetrics(
-			agg.nodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, hw: n.hw, hh: n.hh }))
-		);
-		metrics = {
-			level: 'symbol',
-			source: 'elk-stress',
-			nodes: agg.nodes.length,
-			edges: agg.edges.length,
-			ms: Math.round((performance.now() - t0) * 100) / 100,
-			nodeOverlapRatio: derived.nodeOverlapRatio,
-			nodeOverlapPairs: derived.nodeOverlapPairs,
-			fillNet: Math.round(derived.fillNet * 1e4) / 1e4,
-			cleanupPasses: data.elkStress?.cleanupPasses ?? 0,
-			overlapsBeforeCleanup: 0,
-			overlapsAfterCleanup: derived.nodeOverlapPairs,
-			precomputeMs: data.elkStress?.ms
-		};
-	}
-
-	/** True when every symbol node has a matching cached d3-force position. */
-	function forceCovers(): boolean {
-		if (!forcePositions || !agg) return false;
-		if (forcePositions.size !== agg.nodes.length) return false;
-		for (const node of agg.nodes) if (!forcePositions.has(node.id)) return false;
-		return true;
-	}
-
-	/**
-	 * Place the current symbol aggregate from the cached offline d3-force file and
-	 * re-derive the overlap/fill metrics on the main thread so `nodeOverlapRatio
-	 * === 0` is verified, not assumed (mirrors `applyElkPositions`).
-	 */
-	function applyForcePositions(): void {
-		if (!agg || !forcePositions) return;
-		const t0 = performance.now();
-		for (const node of agg.nodes) {
-			const p = forcePositions.get(node.id);
-			if (p) {
-				node.x = p.x;
-				node.y = p.y;
-			}
-		}
-		const derived = computeMetrics(
-			agg.nodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, hw: n.hw, hh: n.hh }))
-		);
-		metrics = {
-			level: 'symbol',
-			source: 'd3-force-cache',
-			nodes: agg.nodes.length,
-			edges: agg.edges.length,
-			ms: Math.round((performance.now() - t0) * 100) / 100,
-			nodeOverlapRatio: derived.nodeOverlapRatio,
-			nodeOverlapPairs: derived.nodeOverlapPairs,
-			fillNet: Math.round(derived.fillNet * 1e4) / 1e4,
-			cleanupPasses: data.forcePositions?.cleanupPasses ?? 0,
-			overlapsBeforeCleanup: 0,
-			overlapsAfterCleanup: derived.nodeOverlapPairs,
-			precomputeMs: data.forcePositions?.ms
-		};
-	}
-
-	function applyPositions(positions: LayoutResponse['positions']) {
-		if (!agg) return;
-		const pos = new Map(positions.map((p) => [p.id, p]));
-		for (const node of agg.nodes) {
-			const p = pos.get(node.id);
-			if (p) {
-				node.x = p.x;
-				node.y = p.y;
-			}
-		}
-	}
-
 	async function layoutForce(token: number) {
-		if (!agg) return;
-		const res = await runWorker({
+		if (!agg || !worker) return;
+		const res = await worker.run({
 			nodes: agg.nodes.map((n) => ({ id: n.id, hw: n.hw, hh: n.hh })),
 			edges: agg.edges.map((e) => ({ source: e.source, target: e.target, calls: e.calls })),
 			ticks: TICKS[level] ?? 400,
@@ -367,7 +239,7 @@
 			seed: (seed = (seed * 1664525 + 1013904223) >>> 0)
 		});
 		if (token !== layoutToken) return;
-		applyPositions(res.positions);
+		applyPositions(agg, new Map(res.positions.map((p) => [p.id, p])));
 		metrics = {
 			level,
 			source: 'd3-force',
@@ -385,27 +257,10 @@
 
 	function fit() {
 		if (!canvasEl || !agg || !agg.nodes.length) return;
-		const cw = canvasEl.clientWidth;
-		const ch = canvasEl.clientHeight;
-		let lx = Infinity;
-		let rx = -Infinity;
-		let ty = Infinity;
-		let by = -Infinity;
-		for (const node of agg.nodes) {
-			const x = node.x ?? 0;
-			const y = node.y ?? 0;
-			lx = Math.min(lx, x - node.hw);
-			rx = Math.max(rx, x + node.hw);
-			ty = Math.min(ty, y - node.hh);
-			by = Math.max(by, y + node.hh);
-		}
-		const w = Math.max(1, rx - lx);
-		const h = Math.max(1, by - ty);
-		const pad = 48;
-		const k = Math.max(0.02, Math.min((cw - 2 * pad) / w, (ch - 2 * pad) / h));
-		view.k = k;
-		view.tx = cw / 2 - ((lx + rx) / 2) * k;
-		view.ty = ch / 2 - ((ty + by) / 2) * k;
+		const next = computeFit(agg, canvasEl.clientWidth, canvasEl.clientHeight);
+		view.k = next.k;
+		view.tx = next.tx;
+		view.ty = next.ty;
 	}
 
 	// -------------------------------------------------------------------------
@@ -424,103 +279,19 @@
 		draw();
 	}
 
-	function edgeScreenWidth(calls: number): number {
-		return Math.min(4, 0.6 + Math.log2(1 + calls) * 0.7);
-	}
-
 	function draw() {
 		if (!ctx || !canvasEl) return;
-		const cw = canvasEl.clientWidth;
-		const ch = canvasEl.clientHeight;
-		ctx.clearRect(0, 0, cw, ch);
-		if (!agg) return;
-		const { k } = view;
-
-		// edges
-		ctx.lineCap = 'round';
-		for (const edge of agg.edges) {
-			const a = nodeById.get(edge.source);
-			const b = nodeById.get(edge.target);
-			if (!a || !b) continue;
-			const [ax, ay] = worldToScreen(a.x ?? 0, a.y ?? 0);
-			const [bx, by] = worldToScreen(b.x ?? 0, b.y ?? 0);
-			const active =
-				selection.size > 0 &&
-				(selection.has(edge.source) || selection.has(edge.target));
-			const dim =
-				!!searchQuery &&
-				!searchMatches?.has(edge.source) &&
-				!searchMatches?.has(edge.target);
-			if (edge.dispatch === 'virtual') ctx.strokeStyle = active ? '#ffb347' : '#7a5a2a';
-			else ctx.strokeStyle = active ? '#8fbcd4' : '#42505f';
-			ctx.globalAlpha = dim ? 0.05 : active ? 0.95 : 0.5;
-			ctx.lineWidth = edgeScreenWidth(edge.calls);
-			ctx.beginPath();
-			ctx.moveTo(ax, ay);
-			ctx.lineTo(bx, by);
-			ctx.stroke();
-		}
-		ctx.globalAlpha = 1;
-
-		// nodes
-		const showLabels = agg.nodes.length <= 400 || k > 0.12;
-		ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
-		ctx.textBaseline = 'middle';
-		for (const node of agg.nodes) {
-			const [sx, sy] = worldToScreen(node.x ?? 0, node.y ?? 0);
-			const w = node.hw * 2 * k;
-			const h = node.hh * 2 * k;
-			const rx = sx - w / 2;
-			const ry = sy - h / 2;
-			const selected = selection.has(node.id);
-			const hovered = hoverId === node.id;
-			const dim = !!searchQuery && !searchMatches?.has(node.id);
-			ctx.globalAlpha = dim ? 0.12 : 1;
-			if (selected && elevate > 0) {
-				const pad = 2 + elevate * 10;
-				ctx.save();
-				ctx.globalAlpha = 0.15 + 0.35 * elevate;
-				ctx.strokeStyle = '#ffd54a';
-				ctx.lineWidth = 2 + 3 * elevate;
-				ctx.shadowColor = '#ffd54a';
-				ctx.shadowBlur = 16 * elevate;
-				if (w < 26 || h < 8) {
-					ctx.strokeRect(rx - pad, ry - pad, w + pad * 2, h + pad * 2);
-				} else {
-					ctx.beginPath();
-					ctx.roundRect(rx - pad, ry - pad, w + pad * 2, h + pad * 2, 6);
-					ctx.stroke();
-				}
-				ctx.restore();
-			}
-			ctx.fillStyle = nodeFill(node, selected ? 0.95 : 0.82);
-			if (w < 26 || h < 8) {
-				ctx.fillRect(rx, ry, w, h);
-				if (selected || hovered || !dim) {
-					ctx.lineWidth = selected ? 3 : hovered ? 2 : 1;
-					ctx.strokeStyle = selected ? '#ffd54a' : hovered ? '#ffffff' : '#0b0f14';
-					ctx.strokeRect(rx, ry, w, h);
-				}
-			} else {
-				ctx.beginPath();
-				ctx.roundRect(rx, ry, w, h, Math.min(4, w / 2, h / 2));
-				ctx.fill();
-				ctx.lineWidth = selected ? 3 : hovered ? 2 : 1;
-				ctx.strokeStyle = selected ? '#ffd54a' : hovered ? '#ffffff' : '#0b0f14';
-				ctx.stroke();
-			}
-			if (showLabels && w > 30 && h > 10) {
-				// Symbol labels show the real function name (never the line number).
-				const label = level === 'symbol' ? (node.name ?? node.label) : node.label;
-				const text = String(label);
-				const maxChars = Math.max(1, Math.floor((w - 8) / 6.4));
-				const clipped = text.length > maxChars ? text.slice(0, maxChars - 1) + '…' : text;
-				ctx.fillStyle = '#0b0f14';
-				ctx.globalAlpha = dim ? 0.15 : 0.9;
-				ctx.fillText(clipped, rx + 4, sy + 0.5);
-			}
-		}
-		ctx.globalAlpha = 1;
+		drawScene(ctx, canvasEl, {
+			agg,
+			nodeById,
+			view,
+			selection,
+			searchQuery,
+			searchMatches,
+			hoverId,
+			elevate,
+			level
+		});
 	}
 
 	// -------------------------------------------------------------------------
@@ -582,81 +353,8 @@
 	}
 
 	// --- Global → Local handoff ---------------------------------------------
-	const HANDOFF_MAX_IDS = 64;
-
-	/** Index symbol ids by file and by every directory prefix (once per graph). */
-	function buildSymbolMaps(source: SgGraph): void {
-		allSymbolIds = new Set();
-		symbolsByFile = new Map();
-		symbolsByDir = new Map();
-		for (const node of source.nodes) {
-			allSymbolIds.add(node.id);
-			const fileList = symbolsByFile.get(node.file);
-			if (fileList) fileList.push(node.id);
-			else symbolsByFile.set(node.file, [node.id]);
-			const parts = node.file.split('/');
-			for (let i = 1; i < parts.length; i++) {
-				const dir = parts.slice(0, i).join('/');
-				const list = symbolsByDir.get(dir);
-				if (list) list.push(node.id);
-				else symbolsByDir.set(dir, [node.id]);
-			}
-		}
-	}
-
-	/** Resolve any mix of symbol / file / dir ids to a de-duplicated symbol list. */
-	function toSymbolIds(ids: readonly string[]): string[] {
-		const out: string[] = [];
-		const seen = new Set<string>();
-		const push = (list: readonly string[] | undefined) => {
-			if (!list) return;
-			for (const id of list) {
-				if (!seen.has(id)) {
-					seen.add(id);
-					out.push(id);
-				}
-			}
-		};
-		for (const id of ids) {
-			if (allSymbolIds.has(id)) push([id]);
-			else if (symbolsByFile.has(id)) push(symbolsByFile.get(id));
-			else push(symbolsByDir.get(id));
-		}
-		return out;
-	}
-
-	function selectionBounds(): { cx: number; cy: number; w: number; h: number } | null {
-		if (!agg || !selection.size) return null;
-		let lx = Infinity;
-		let rx = -Infinity;
-		let ty = Infinity;
-		let by = -Infinity;
-		for (const id of selection) {
-			const node = nodeById.get(id);
-			if (!node) continue;
-			const x = node.x ?? 0;
-			const y = node.y ?? 0;
-			lx = Math.min(lx, x - node.hw);
-			rx = Math.max(rx, x + node.hw);
-			ty = Math.min(ty, y - node.hh);
-			by = Math.max(by, y + node.hh);
-		}
-		if (!Number.isFinite(lx)) return null;
-		return { cx: (lx + rx) / 2, cy: (ty + by) / 2, w: rx - lx, h: ty - by };
-	}
-
-	function zoomToBounds(
-		bounds: { cx: number; cy: number; w: number; h: number },
-		pad = 90
-	): { k: number; tx: number; ty: number } | null {
-		if (!canvasEl) return null;
-		const cw = canvasEl.clientWidth;
-		const ch = canvasEl.clientHeight;
-		const k = Math.max(
-			0.05,
-			Math.min(8, Math.min((cw - pad) / Math.max(1, bounds.w), (ch - pad) / Math.max(1, bounds.h)))
-		);
-		return { k, tx: cw / 2 - bounds.cx * k, ty: ch / 2 - bounds.cy * k };
+	function hitTestAt(sx: number, sy: number): AggNode | null {
+		return agg ? hitTest(agg, view, sx, sy) : null;
 	}
 
 	/**
@@ -665,8 +363,11 @@
 	 * falls back to an immediate call when there is nothing to animate.
 	 */
 	async function animateSelection(run: () => void): Promise<void> {
-		const bounds = selectionBounds();
-		const target = bounds ? zoomToBounds(bounds) : null;
+		const bounds = selectionBounds(selection, nodeById);
+		const target =
+			bounds && canvasEl
+				? zoomToBounds(bounds, canvasEl.clientWidth, canvasEl.clientHeight)
+				: null;
 		if (!target || !canvasEl) {
 			run();
 			return;
@@ -698,15 +399,10 @@
 	/** Persist the selection and navigate to Local, with a short pre-animation. */
 	function openLocal(ids?: string[]): void {
 		if (navigating) return;
-		const symbols = toSymbolIds(ids ?? [...selection]);
+		const symbols = toSymbolIds(ids ?? [...selection], symbolMaps);
 		if (!symbols.length) return;
-		const capped =
-			symbols.length > HANDOFF_MAX_IDS ? symbols.slice(0, HANDOFF_MAX_IDS) : symbols;
-		try {
-			localStorage.setItem(HANDOFF_KEY, JSON.stringify({ ids: capped, ts: Date.now() }));
-		} catch {
-			/* storage unavailable — the query string still carries the ids */
-		}
+		const capped = capHandoff(symbols);
+		persistHandoff(capped);
 		navigating = true;
 		void animateSelection(() => {
 			void goto('/local?ids=' + capped.join(','))
@@ -720,14 +416,10 @@
 	// --- keyboard navigation -------------------------------------------------
 	function zoomBy(factor: number): void {
 		if (!canvasEl) return;
-		const cx = canvasEl.clientWidth / 2;
-		const cy = canvasEl.clientHeight / 2;
-		const k = Math.max(0.02, Math.min(40, view.k * factor));
-		const wx = (cx - view.tx) / view.k;
-		const wy = (cy - view.ty) / view.k;
-		view.k = k;
-		view.tx = cx - wx * k;
-		view.ty = cy - wy * k;
+		const next = zoomAround(view, canvasEl.clientWidth / 2, canvasEl.clientHeight / 2, factor);
+		view.k = next.k;
+		view.tx = next.tx;
+		view.ty = next.ty;
 		draw();
 	}
 
@@ -737,67 +429,21 @@
 	}
 
 	/** Move the single selection to the nearest node in `dir` (aligned-bias). */
-	function moveSelection(dir: 'left' | 'right' | 'up' | 'down'): void {
+	function moveSelection(dir: Direction): void {
 		if (!agg || !agg.nodes.length) return;
 		let current: AggNode | undefined;
 		if (selection.size === 1) current = nodeById.get([...selection][0]);
 		if (!current) {
-			const cx = canvasEl ? canvasEl.clientWidth / 2 : 0;
-			const cy = canvasEl ? canvasEl.clientHeight / 2 : 0;
-			let best = Infinity;
-			for (const node of agg.nodes) {
-				const [sx, sy] = worldToScreen(node.x ?? 0, node.y ?? 0);
-				const d = (sx - cx) ** 2 + (sy - cy) ** 2;
-				if (d < best) {
-					best = d;
-					current = node;
-				}
-			}
+			current =
+				nearestToCenter(agg, view, canvasEl?.clientWidth ?? 0, canvasEl?.clientHeight ?? 0) ??
+				undefined;
 		}
 		if (!current) return;
-		const cx = current.x ?? 0;
-		const cy = current.y ?? 0;
-		let best: AggNode | null = null;
-		let bestScore = Infinity;
-		for (const node of agg.nodes) {
-			if (node === current) continue;
-			const dx = (node.x ?? 0) - cx;
-			const dy = (node.y ?? 0) - cy;
-			let primary: number;
-			let cross: number;
-			if (dir === 'right') {
-				if (dx <= 0.5) continue;
-				primary = dx;
-				cross = Math.abs(dy);
-			} else if (dir === 'left') {
-				if (dx >= -0.5) continue;
-				primary = -dx;
-				cross = Math.abs(dy);
-			} else if (dir === 'down') {
-				if (dy <= 0.5) continue;
-				primary = dy;
-				cross = Math.abs(dx);
-			} else {
-				if (dy >= -0.5) continue;
-				primary = -dy;
-				cross = Math.abs(dx);
-			}
-			const score = primary + cross * 2.2;
-			if (score < bestScore) {
-				bestScore = score;
-				best = node;
-			}
-		}
+		const best = nearestInDirection(agg, current, dir);
 		if (best) {
 			select([best.id]);
 			centerOn(best.id, Math.max(view.k, 0.5));
 		}
-	}
-
-	function isTypingTarget(target: EventTarget | null): boolean {
-		const el = target as HTMLElement | null;
-		if (!el) return false;
-		return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
 	}
 
 	function focusOutlineSearch(): void {
@@ -888,58 +534,17 @@
 	// -------------------------------------------------------------------------
 	// interaction
 	// -------------------------------------------------------------------------
-	function pointerPos(event: { clientX: number; clientY: number }): [number, number] {
-		if (!canvasEl) return [0, 0];
-		const rect = canvasEl.getBoundingClientRect();
-		return [event.clientX - rect.left, event.clientY - rect.top];
-	}
-
-	function hitTest(sx: number, sy: number): AggNode | null {
-		if (!agg) return null;
-		const k = view.k;
-		for (let i = agg.nodes.length - 1; i >= 0; i--) {
-			const node = agg.nodes[i];
-			const [cx, cy] = worldToScreen(node.x ?? 0, node.y ?? 0);
-			if (Math.abs(sx - cx) <= node.hw * k && Math.abs(sy - cy) <= node.hh * k) return node;
-		}
-		return null;
-	}
-
 	function showTooltip(node: AggNode, clientX: number, clientY: number) {
 		if (!canvasEl) return;
 		const rect = canvasEl.getBoundingClientRect();
 		const x = clientX - rect.left + 14;
 		const y = clientY - rect.top + 14;
-		const key = node.id;
-		if (key === lastTooltipKey) {
+		if (node.id === lastTooltipKey) {
 			tooltip = { ...(tooltip as Tooltip), x, y };
 			return;
 		}
-		lastTooltipKey = key;
-		if (level === 'symbol') {
-			const member = node.members[0];
-			tooltip = {
-				x,
-				y,
-				title: member?.name ?? node.name ?? node.label,
-				body:
-					`${member?.file ?? node.file}:${member?.line ?? node.line}\n` +
-					`kind ${member?.kind ?? node.kind} · degree ${node.weight}` +
-					`${member?.svelte ? ' · .svelte' : ''}`
-			};
-		} else {
-			const samples = node.members
-				.slice(0, 4)
-				.map((m) => m.name)
-				.join(', ');
-			tooltip = {
-				x,
-				y,
-				title: node.id,
-				body: `${node.weight} symbols · ${node.intraCalls} intra-group calls`,
-				muted: `${samples}${node.members.length > 4 ? '…' : ''}`
-			};
-		}
+		lastTooltipKey = node.id;
+		tooltip = tooltipFor(node, level, x, y);
 	}
 
 	function hideTooltip() {
@@ -947,198 +552,22 @@
 		lastTooltipKey = '';
 	}
 
-	function onPointerDown(event: PointerEvent) {
-		if (!canvasEl) return;
-		const [x, y] = pointerPos(event);
-		activePointers.set(event.pointerId, { x, y });
-		try {
-			canvasEl.setPointerCapture(event.pointerId);
-		} catch {
-			/* synthetic pointer events have no active pointer to capture */
-		}
-
-		// Second finger → pinch zoom; abandon any pan/select gesture in flight.
-		if (activePointers.size === 2) {
-			drag = null;
-			selBox = null;
-			panning = false;
-			selecting = false;
-			const [p1, p2] = [...activePointers.values()];
-			const midX = (p1.x + p2.x) / 2;
-			const midY = (p1.y + p2.y) / 2;
-			const startDist = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
-			pinch = { startDist, startK: view.k, midX, midY, startTx: view.tx, startTy: view.ty };
-			suppressTap = true;
-			return;
-		}
-		if (activePointers.size > 2 || pinch) return; // ignore extra fingers mid-pinch
-
-		const mode = event.shiftKey ? 'select' : 'pan';
-		drag = {
-			mode,
-			startX: x,
-			startY: y,
-			moved: false,
-			tx: view.tx,
-			ty: view.ty,
-			selStart: [x, y]
-		};
-		panning = mode === 'pan';
-		selecting = mode === 'select';
-		if (mode === 'select') selBox = { x, y, w: 0, h: 0 };
-	}
-
-	function onPointerMove(event: PointerEvent) {
-		if (activePointers.has(event.pointerId)) {
-			const [px, py] = pointerPos(event);
-			activePointers.set(event.pointerId, { x: px, y: py });
-		}
-
-		// Two-finger pinch: scale around the midpoint (and pan with it).
-		if (pinch && activePointers.size >= 2) {
-			const [p1, p2] = [...activePointers.values()];
-			const curMidX = (p1.x + p2.x) / 2;
-			const curMidY = (p1.y + p2.y) / 2;
-			const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
-			const k = Math.max(0.02, Math.min(40, pinch.startK * (dist / pinch.startDist)));
-			const wx = (pinch.midX - pinch.startTx) / pinch.startK;
-			const wy = (pinch.midY - pinch.startTy) / pinch.startK;
-			view.k = k;
-			view.tx = curMidX - wx * k;
-			view.ty = curMidY - wy * k;
-			draw();
-			return;
-		}
-
-		const [x, y] = pointerPos(event);
-		if (drag) {
-			const dx = x - drag.startX;
-			const dy = y - drag.startY;
-			if (Math.hypot(dx, dy) > TAP_SLOP) drag.moved = true;
-			if (drag.mode === 'pan') {
-				view.tx = drag.tx + dx;
-				view.ty = drag.ty + dy;
-				draw();
-			} else {
-				const x0 = Math.min(drag.selStart[0], x);
-				const y0 = Math.min(drag.selStart[1], y);
-				const w = Math.abs(x - drag.selStart[0]);
-				const h = Math.abs(y - drag.selStart[1]);
-				drag.rect = { x: x0, y: y0, w, h };
-				selBox = drag.rect;
-			}
-			return;
-		}
-		const node = hitTest(x, y);
-		hoverId = node ? node.id : null;
-		if (node) showTooltip(node, event.clientX, event.clientY);
-		else hideTooltip();
-		draw();
-	}
-
-	function onPointerUp(event: PointerEvent) {
-		activePointers.delete(event.pointerId);
-		const wasPinch = pinch !== null;
-		if (wasPinch) {
-			// Keep suppressing until every finger is up so a pinch never taps.
-			if (activePointers.size < 2) pinch = null;
-			suppressTap = true;
-			panning = false;
-			selecting = false;
-			selBox = null;
-			drag = null;
-			try {
-				canvasEl?.releasePointerCapture(event.pointerId);
-			} catch {
-				/* pointer already released */
-			}
-			return;
-		}
-
-		panning = false;
-		selecting = false;
-		if (drag && drag.mode === 'select' && drag.rect) {
-			finalizeBoxSelect(drag.rect);
-		} else if (drag && drag.mode === 'pan' && !drag.moved && !suppressTap) {
-			// A tap/click (movement below the slop) activates the node under the
-			// pointer; clicking empty space clears the selection.
-			const [x, y] = pointerPos(event);
-			const node = hitTest(x, y);
-			if (node) {
-				select([node.id]);
-				hideTooltip();
-			} else if (selection.size) {
-				select([]);
-			}
-		}
-		suppressTap = false;
-		selBox = null;
-		drag = null;
-		try {
-			canvasEl?.releasePointerCapture(event.pointerId);
-		} catch {
-			/* pointer already released */
-		}
-	}
-
-	function onPointerCancel(event: PointerEvent) {
-		activePointers.delete(event.pointerId);
-		panning = false;
-		selecting = false;
-		selBox = null;
-		drag = null;
-		pinch = null;
-		suppressTap = false;
-	}
-
-	function onPointerLeave() {
-		if (drag) return;
-		hoverId = null;
-		hideTooltip();
-		draw();
-	}
-
 	/** Drag the tree/canvas divider; width is clamped and persisted on release. */
-	function onSplitterDown(event: PointerEvent) {
-		const el = event.currentTarget as HTMLElement;
-		const startX = event.clientX;
-		const startWidth = outlineWidth;
-		event.preventDefault();
-		try {
-			el.setPointerCapture(event.pointerId);
-		} catch {
-			/* synthetic pointer events have no active pointer to capture */
-		}
-		const onMove = (e: PointerEvent) => {
-			outlineWidth = Math.max(
-				OUTLINE_MIN_W,
-				Math.min(OUTLINE_MAX_W, startWidth + (e.clientX - startX))
-			);
+	function splitterOptions() {
+		return {
+			getWidth: () => outlineWidth,
+			setWidth: (width: number) => (outlineWidth = width),
+			min: OUTLINE_MIN_W,
+			max: OUTLINE_MAX_W,
+			storageKey: OUTLINE_WIDTH_KEY
 		};
-		const onUp = (e: PointerEvent) => {
-			el.removeEventListener('pointermove', onMove);
-			el.removeEventListener('pointerup', onUp);
-			el.removeEventListener('pointercancel', onUp);
-			try {
-				el.releasePointerCapture(e.pointerId);
-			} catch {
-				/* ignore */
-			}
-			try {
-				localStorage.setItem(OUTLINE_WIDTH_KEY, String(outlineWidth));
-			} catch {
-				/* storage unavailable */
-			}
-		};
-		el.addEventListener('pointermove', onMove);
-		el.addEventListener('pointerup', onUp);
-		el.addEventListener('pointercancel', onUp);
 	}
 
 	function onContextMenu(event: MouseEvent) {
 		event.preventDefault();
-		const [x, y] = pointerPos(event);
-		const node = hitTest(x, y);
+		if (!canvasEl) return;
+		const rect = canvasEl.getBoundingClientRect();
+		const node = hitTestAt(event.clientX - rect.left, event.clientY - rect.top);
 		if (!node) return;
 		const target = jumpToSource(node);
 		showToast(
@@ -1148,38 +577,9 @@
 		);
 	}
 
-	function onWheel(event: WheelEvent) {
-		event.preventDefault();
-		const [x, y] = pointerPos(event);
-		const factor = Math.exp(-event.deltaY * 0.0015);
-		const k = Math.max(0.02, Math.min(40, view.k * factor));
-		const wx = (x - view.tx) / view.k;
-		const wy = (y - view.ty) / view.k;
-		view.k = k;
-		view.tx = x - wx * k;
-		view.ty = y - wy * k;
-		draw();
-	}
-
 	function finalizeBoxSelect(rect: Box) {
 		if (!agg) return;
-		const { k, tx, ty } = view;
-		const wx0 = (rect.x - tx) / k;
-		const wy0 = (rect.y - ty) / k;
-		const wx1 = (rect.x + rect.w - tx) / k;
-		const wy1 = (rect.y + rect.h - ty) / k;
-		const box = {
-			lx: Math.min(wx0, wx1),
-			rx: Math.max(wx0, wx1),
-			ty: Math.min(wy0, wy1),
-			by: Math.max(wy0, wy1)
-		};
-		const ids: string[] = [];
-		for (const node of agg.nodes) {
-			const r = rectOf({ x: node.x ?? 0, y: node.y ?? 0, hw: node.hw, hh: node.hh });
-			if (r.lx < box.rx && r.rx > box.lx && r.ty < box.by && r.by > box.ty) ids.push(node.id);
-		}
-		select(ids);
+		select(boxSelectIds(agg, view, rect));
 	}
 
 	// -------------------------------------------------------------------------
@@ -1192,16 +592,8 @@
 			searchMatches = null;
 			searchCount = '';
 		} else {
-			const matches = new Set<string>();
-			for (const node of agg.nodes) {
-				const hay =
-					level === 'symbol'
-						? `${node.id} ${node.name ?? ''} ${node.kind ?? ''}`
-						: node.id;
-				if (hay.toLowerCase().includes(q)) matches.add(node.id);
-			}
-			searchMatches = matches;
-			searchCount = `${matches.size} match`;
+			searchMatches = matchNodes(agg, level, q);
+			searchCount = `${searchMatches.size} match`;
 		}
 		draw();
 	}
@@ -1231,7 +623,7 @@
 
 	onMount(() => {
 		graph = data.graph;
-		if (graph) buildSymbolMaps(graph);
+		if (graph) symbolMaps = buildSymbolMaps(graph);
 		if (data.elkStress) {
 			elkPositions = new Map(data.elkStress.positions.map((p) => [p.id, p]));
 		}
@@ -1253,28 +645,35 @@
 		if (!canvasEl) return;
 		ctx = canvasEl.getContext('2d');
 
-		worker = new Worker(new URL('../../lib/global/layout.worker.ts', import.meta.url), {
-			type: 'module'
-		});
-		worker.onmessage = (event: MessageEvent<LayoutResponse>) => {
-			const entry = pending.get(event.data.token);
-			if (!entry) return;
-			pending.delete(event.data.token);
-			entry.resolve(event.data);
-		};
-		worker.onerror = (err) => {
-			for (const entry of pending.values()) entry.reject(err);
-			pending.clear();
-			setStatus(`worker error: ${err.message}`);
-		};
+		worker = createLayoutWorker(
+			new URL('../../lib/global/layout.worker.ts', import.meta.url)
+		);
 
-		canvasEl.addEventListener('wheel', onWheel, { passive: false });
+		pointer = createPointerController({
+			canvas: () => canvasEl,
+			view,
+			draw,
+			select: (ids) => {
+				select(ids);
+			},
+			hitTest: hitTestAt,
+			selectionSize: () => selection.size,
+			showTooltip,
+			hideTooltip,
+			setPanning: (value) => (panning = value),
+			setSelecting: (value) => (selecting = value),
+			setSelBox: (box) => (selBox = box),
+			setHoverId: (id) => (hoverId = id),
+			finalizeBoxSelect
+		});
+		pointer.attach(canvasEl);
+
 		window.addEventListener('resize', resize);
 		window.addEventListener('keydown', onKeyDown);
 		const resizeObserver = new ResizeObserver(() => resize());
 		resizeObserver.observe(canvasEl);
 
-		const handle = {
+		const handle = createGlobalDebug({
 			setLevel,
 			setLayoutMode,
 			select,
@@ -1287,29 +686,19 @@
 				fit();
 				draw();
 			},
-			focus: (id: string) => focus(id),
-			center: (id: string) => centerOn(id),
-			openLocal: (ids?: string[]) => openLocal(ids),
+			focus: (id) => focus(id),
+			center: (id) => centerOn(id),
+			openLocal: (ids) => openLocal(ids),
 			level: () => level,
-			labels: () =>
-				(agg?.nodes ?? []).map((n) => ({ id: n.id, name: n.name, label: n.label })),
-			nodeIds: () => (agg?.nodes ?? []).map((n) => n.id),
-			positions: () =>
-				(agg?.nodes ?? []).map((n) => ({
-					id: n.id,
-					x: n.x ?? 0,
-					y: n.y ?? 0,
-					w: n.hw * 2,
-					h: n.hh * 2
-				})),
-			screenPos: (id: string) => {
+			agg: () => agg,
+			screenPos: (id) => {
 				const node = nodeById.get(id);
 				if (!node) return null;
-				const [x, y] = worldToScreen(node.x ?? 0, node.y ?? 0);
+				const [x, y] = worldToScreen(view, node.x ?? 0, node.y ?? 0);
 				return { x, y, hw: node.hw, hh: node.hh, k: view.k };
 			}
-		};
-		(window as unknown as { __global: typeof handle }).__global = handle;
+		});
+		(window as unknown as { __global: GlobalDebugApi }).__global = handle;
 
 		resize();
 		void bootstrap();
@@ -1318,10 +707,9 @@
 			window.removeEventListener('resize', resize);
 			window.removeEventListener('keydown', onKeyDown);
 			resizeObserver.disconnect();
-			canvasEl?.removeEventListener('wheel', onWheel);
+			pointer?.detach();
 			worker?.terminate();
 			worker = null;
-			pending.clear();
 		};
 	});
 
@@ -1355,140 +743,71 @@
 			aria-orientation="vertical"
 			aria-label="Resize outline"
 			title="drag to resize the outline"
-			onpointerdown={onSplitterDown}
+			onpointerdown={(event) => handleSplitterDrag(event, splitterOptions())}
 		></div>
 	{/if}
 	<div class="stage">
-	<canvas
-		bind:this={canvasEl}
-		class:panning
-		class:selecting
-		onpointerdown={onPointerDown}
-		onpointermove={onPointerMove}
-		onpointerup={onPointerUp}
-		onpointercancel={onPointerCancel}
-		onpointerleave={onPointerLeave}
-		oncontextmenu={onContextMenu}
-	></canvas>
+		<canvas
+			bind:this={canvasEl}
+			class:panning
+			class:selecting
+			oncontextmenu={onContextMenu}
+		></canvas>
 
-	<div class="toolbar">
-		<div class="group">
-			<span class="title">layout</span>
-			<button
-				class:active={layoutMode === 'd3-force'}
-				onclick={() => setLayoutMode('d3-force')}
-				title="live d3-force in a Web Worker (symbol ≈ 6 s)">d3-force</button
-			>
-			<button
-				class:active={layoutMode === 'elk-stress'}
-				disabled={!elkAvailable}
-				onclick={() => setLayoutMode('elk-stress')}
-				title={elkAvailable
-					? `precomputed ELK stress (symbol only, offline ${elkPrecomputeMs} ms) — instant load`
-					: 'precomputed layout missing — run bun run precompute:elk'}>elk-stress</button
-			>
+		<GlobalToolbar
+			{layoutMode}
+			{elkAvailable}
+			{elkPrecomputeMs}
+			{level}
+			{searchCount}
+			{outlineCollapsed}
+			{metrics}
+			onsetlayoutmode={(mode) => void setLayoutMode(mode)}
+			onsetlevel={(lv) => void setLevel(lv)}
+			onrelayout={() => void relayout(true)}
+			onfit={() => {
+				fit();
+				draw();
+			}}
+			ontogglehelp={() => (helpOpen = !helpOpen)}
+			onsearch={onSearchInput}
+			ontoggleoutline={() => (outlineCollapsed = !outlineCollapsed)}
+		/>
+
+		<div class="hint">
+			tap/click select · drag pan · wheel / pinch zoom · shift+drag select · / search · arrows move · Enter → Local · j jump · ? help
 		</div>
-		<div class="group">
-			<span class="title">level</span>
-			{#each LEVELS as lv (lv)}
-				<button class:active={level === lv} onclick={() => setLevel(lv)}>{lv}</button>
-			{/each}
-		</div>
-		<div class="group">
-			<button onclick={() => relayout(true)} title="re-run d3-force live in the worker">re-layout</button>
-			<button
-				onclick={() => {
-					fit();
-					draw();
-				}}
-				title="fit graph to view">fit</button
-			>
-			<button onclick={() => (helpOpen = !helpOpen)} title="keyboard shortcuts (?)">?</button>
-		</div>
-		<div class="group">
-			<input
-				type="search"
-				placeholder="search name / file / id"
-				autocomplete="off"
-				oninput={onSearchInput}
-			/>
-			<span class="search-count">{searchCount}</span>
-		</div>
-		<div class="group right">
-			<button
-				class="collapse-toggle"
-				title={outlineCollapsed ? 'show outline' : 'hide outline'}
-				aria-label={outlineCollapsed ? 'show outline' : 'hide outline'}
-				aria-expanded={!outlineCollapsed}
-				onclick={() => (outlineCollapsed = !outlineCollapsed)}
-			>
-				{outlineCollapsed ? '»' : '«'}
-			</button>
-		</div>
-		{#if metrics}
-			<div class="metrics">
-				<b>{metrics.level}</b> · <b>{metrics.source}</b> · nodes <b>{metrics.nodes}</b> · edges
-				<b>{metrics.edges}</b> · ms <b>{metrics.ms}</b> · overlap
-				<b>{metrics.nodeOverlapRatio}</b> · fill <b>{metrics.fillNet}</b>
-				{#if metrics.precomputeMs !== undefined}
-					· precomputed <b>{metrics.precomputeMs}ms</b>
-				{/if}
+
+		{#if tooltip}
+			<div class="tooltip" style={`left:${tooltip.x}px; top:${tooltip.y}px`}>
+				<div class="tt-title">{tooltip.title}</div>
+				{tooltip.body}
+				{#if tooltip.muted}<span class="tt-muted">{tooltip.muted}</span>{/if}
 			</div>
 		{/if}
-	</div>
 
-	<div class="hint">
-		tap/click select · drag pan · wheel / pinch zoom · shift+drag select · / search · arrows move · Enter → Local · j jump · ? help
-	</div>
+		{#if selectionCount > 0}
+			<button class="jump" onclick={() => openLocal()}>→ Local ({selectionCount})</button>
+		{/if}
 
-	{#if tooltip}
-		<div class="tooltip" style={`left:${tooltip.x}px; top:${tooltip.y}px`}>
-			<div class="tt-title">{tooltip.title}</div>
-			{tooltip.body}
-			{#if tooltip.muted}<span class="tt-muted">{tooltip.muted}</span>{/if}
-		</div>
-	{/if}
+		{#if status}
+			<div class="status">{status}</div>
+		{/if}
 
-	{#if selectionCount > 0}
-		<button class="jump" onclick={() => openLocal()}>→ Local ({selectionCount})</button>
-	{/if}
+		{#if toast}
+			<div class="toast">{toast}</div>
+		{/if}
 
-	{#if status}
-		<div class="status">{status}</div>
-	{/if}
+		{#if selBox}
+			<div
+				class="selbox"
+				style={`left:${selBox.x}px; top:${selBox.y}px; width:${selBox.w}px; height:${selBox.h}px`}
+			></div>
+		{/if}
 
-	{#if toast}
-		<div class="toast">{toast}</div>
-	{/if}
-
-	{#if selBox}
-		<div
-			class="selbox"
-			style={`left:${selBox.x}px; top:${selBox.y}px; width:${selBox.w}px; height:${selBox.h}px`}
-		></div>
-	{/if}
-
-	{#if helpOpen}
-		<div class="help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
-			<div class="help-card">
-				<h3>Keyboard shortcuts</h3>
-				<dl>
-					<dt>click / tap</dt><dd>select the node under the pointer</dd>
-					<dt>drag / touch drag</dt><dd>pan the viewport</dd>
-					<dt>pinch / wheel</dt><dd>zoom in / out</dd>
-					<dt>← ↑ → ↓</dt><dd>move selection to nearest node</dd>
-					<dt>+ / −</dt><dd>zoom in / out</dd>
-					<dt>0</dt><dd>fit graph</dd>
-					<dt>/</dt><dd>focus outline search</dd>
-					<dt>Enter</dt><dd>open selection in Local</dd>
-					<dt>j</dt><dd>jump to source</dd>
-					<dt>Esc</dt><dd>clear selection / close help</dd>
-					<dt>?</dt><dd>toggle this help</dd>
-				</dl>
-				<button onclick={() => (helpOpen = false)}>close</button>
-			</div>
-		</div>
-	{/if}
+		{#if helpOpen}
+			<GlobalHelp onclose={() => (helpOpen = false)} />
+		{/if}
 	</div>
 </div>
 
@@ -1558,42 +877,6 @@
 		cursor: crosshair;
 	}
 
-	.toolbar {
-		position: absolute;
-		top: 10px;
-		left: 10px;
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 14px;
-		padding: 8px 12px;
-		max-width: calc(100% - 20px);
-		background: #171c24cc;
-		border: 1px solid #2a3340;
-		border-radius: 8px;
-		backdrop-filter: blur(6px);
-	}
-
-	.group {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-	}
-
-	.group.right {
-		margin-left: auto;
-	}
-
-	.collapse-toggle {
-		min-width: 28px;
-		font-size: 13px;
-		line-height: 1;
-	}
-
-	.title {
-		color: #8b98a8;
-	}
-
 	button {
 		font: inherit;
 		color: #d5dde8;
@@ -1606,49 +889,6 @@
 
 	button:hover {
 		border-color: #ffd54a;
-	}
-
-	button:disabled {
-		opacity: 0.4;
-		cursor: not-allowed;
-	}
-
-	button:disabled:hover {
-		border-color: #2a3340;
-	}
-
-	button.active {
-		background: #ffd54a;
-		color: #1a1a1a;
-		border-color: #ffd54a;
-	}
-
-	input {
-		font: inherit;
-		color: #d5dde8;
-		background: #0e1116;
-		border: 1px solid #2a3340;
-		border-radius: 6px;
-		padding: 3px 8px;
-		width: 24ch;
-	}
-
-	input:focus {
-		outline: 1px solid #ffd54a;
-	}
-
-	.search-count {
-		color: #8b98a8;
-		min-width: 10ch;
-	}
-
-	.metrics {
-		color: #8b98a8;
-		white-space: nowrap;
-	}
-
-	.metrics b {
-		color: #d5dde8;
 	}
 
 	.hint {
@@ -1724,45 +964,5 @@
 		border: 1px dashed #ffd54a;
 		background: #ffd54a22;
 		pointer-events: none;
-	}
-
-	.help {
-		position: absolute;
-		inset: 0;
-		z-index: 10;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		background: #0b0f1499;
-	}
-
-	.help-card {
-		min-width: 320px;
-		padding: 16px 20px;
-		color: #d5dde8;
-		background: #171c24f2;
-		border: 1px solid #2a3340;
-		border-radius: 10px;
-		box-shadow: 0 18px 48px #0008;
-	}
-
-	.help-card h3 {
-		margin: 0 0 10px;
-		color: #ffd54a;
-	}
-
-	.help-card dl {
-		display: grid;
-		grid-template-columns: auto 1fr;
-		gap: 4px 14px;
-		margin: 0 0 12px;
-	}
-
-	.help-card dt {
-		color: #9fd0e8;
-	}
-
-	.help-card dd {
-		margin: 0;
 	}
 </style>
