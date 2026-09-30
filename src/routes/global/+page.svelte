@@ -24,9 +24,18 @@
 		LayoutResponse
 	} from '$lib/global/layout.worker';
 	import type { ElkStressLayout, ElkStressPosition } from '$lib/global/elk-stress';
+	import type { ForceLayout, ForcePosition } from '$lib/global/force-cache';
 	import { jumpToSource } from '$lib/global/jump';
 
-	let { data }: { data: { graph: SgGraph | null; elkStress: ElkStressLayout | null } } = $props();
+	let {
+		data
+	}: {
+		data: {
+			graph: SgGraph | null;
+			elkStress: ElkStressLayout | null;
+			forcePositions: ForceLayout | null;
+		};
+	} = $props();
 
 	const TICKS: Record<Level, number> = { dir: 320, file: 450, symbol: 400 };
 	const PARAMS: Record<Level, LayoutParams> = {
@@ -35,8 +44,13 @@
 		symbol: { linkDistance: 80, linkStrength: 0.15, charge: -40, chargeDistanceMax: 600 }
 	};
 	const HANDOFF_KEY = 'gpen.scip.selection';
+	const OUTLINE_WIDTH_KEY = 'gpen.scip.outlineWidth';
+	const OUTLINE_MIN_W = 200;
+	const OUTLINE_MAX_W = 760;
+	/** Pointer travel (px) below which a pointerup counts as a tap, not a pan. */
+	const TAP_SLOP = 6;
 
-	/** Live d3-force worker (default) or the precomputed offline ELK stress layout. */
+	/** Live d3-force worker (default), cached d3-force, or offline ELK stress. */
 	type LayoutMode = 'd3-force' | 'elk-stress';
 
 	type GlobalMetrics = {
@@ -90,6 +104,15 @@
 	let symbolsByDir = new Map<string, string[]>();
 	/** Precomputed elk-stress positions keyed by symbol id (null when absent). */
 	let elkPositions: Map<string, ElkStressPosition> | null = null;
+	/** Cached offline d3-force positions keyed by symbol id (null when absent). */
+	let forcePositions: Map<string, ForcePosition> | null = null;
+	/** Live pointers (touch + mouse) for pan / pinch disambiguation. */
+	const activePointers = new Map<number, { x: number; y: number }>();
+	let pinch:
+		| { startDist: number; startK: number; midX: number; midY: number; startTx: number; startTy: number }
+		| null = null;
+	/** Set once a gesture becomes a pinch so the trailing finger-up is not a tap. */
+	let suppressTap = false;
 
 	let canvasEl: HTMLCanvasElement | undefined = $state();
 	let ctx: CanvasRenderingContext2D | null = null;
@@ -115,6 +138,8 @@
 	let panning = $state(false);
 	let selecting = $state(false);
 	let outlineCollapsed = $state(false);
+	/** Sidebar width in px (drag the splitter to resize; persisted below). */
+	let outlineWidth = $state(300);
 	let helpOpen = $state(false);
 	/** Reactive mirror of the canvas selection for the outline sidebar. */
 	let selectedKeys = $state<string[]>([]);
@@ -199,7 +224,7 @@
 		selectedKeys = [...selection];
 	}
 
-	async function relayout(): Promise<GlobalMetrics | undefined> {
+	async function relayout(forceLive = false): Promise<GlobalMetrics | undefined> {
 		if (!graph) return;
 		const token = ++layoutToken;
 		agg = aggregate(graph, level);
@@ -216,6 +241,16 @@
 		if (layoutMode === 'elk-stress' && level === 'symbol') {
 			layoutMode = 'd3-force';
 			showToast('precomputed elk-stress layout is stale — run bun run precompute:elk');
+		}
+		// Cached offline d3-force symbol layout: instant, no worker. The explicit
+		// re-layout button passes `forceLive` to force a fresh worker run.
+		if (!forceLive && layoutMode === 'd3-force' && level === 'symbol' && forceCovers()) {
+			applyForcePositions();
+			if (token !== layoutToken) return metrics ?? undefined;
+			setStatus(null);
+			fit();
+			draw();
+			return metrics ?? undefined;
 		}
 		setStatus(`computing ${level} layout in worker…`);
 		await layoutForce(token);
@@ -265,6 +300,48 @@
 			overlapsBeforeCleanup: 0,
 			overlapsAfterCleanup: derived.nodeOverlapPairs,
 			precomputeMs: data.elkStress?.ms
+		};
+	}
+
+	/** True when every symbol node has a matching cached d3-force position. */
+	function forceCovers(): boolean {
+		if (!forcePositions || !agg) return false;
+		if (forcePositions.size !== agg.nodes.length) return false;
+		for (const node of agg.nodes) if (!forcePositions.has(node.id)) return false;
+		return true;
+	}
+
+	/**
+	 * Place the current symbol aggregate from the cached offline d3-force file and
+	 * re-derive the overlap/fill metrics on the main thread so `nodeOverlapRatio
+	 * === 0` is verified, not assumed (mirrors `applyElkPositions`).
+	 */
+	function applyForcePositions(): void {
+		if (!agg || !forcePositions) return;
+		const t0 = performance.now();
+		for (const node of agg.nodes) {
+			const p = forcePositions.get(node.id);
+			if (p) {
+				node.x = p.x;
+				node.y = p.y;
+			}
+		}
+		const derived = computeMetrics(
+			agg.nodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, hw: n.hw, hh: n.hh }))
+		);
+		metrics = {
+			level: 'symbol',
+			source: 'd3-force-cache',
+			nodes: agg.nodes.length,
+			edges: agg.edges.length,
+			ms: Math.round((performance.now() - t0) * 100) / 100,
+			nodeOverlapRatio: derived.nodeOverlapRatio,
+			nodeOverlapPairs: derived.nodeOverlapPairs,
+			fillNet: Math.round(derived.fillNet * 1e4) / 1e4,
+			cleanupPasses: data.forcePositions?.cleanupPasses ?? 0,
+			overlapsBeforeCleanup: 0,
+			overlapsAfterCleanup: derived.nodeOverlapPairs,
+			precomputeMs: data.forcePositions?.ms
 		};
 	}
 
@@ -873,6 +950,29 @@
 	function onPointerDown(event: PointerEvent) {
 		if (!canvasEl) return;
 		const [x, y] = pointerPos(event);
+		activePointers.set(event.pointerId, { x, y });
+		try {
+			canvasEl.setPointerCapture(event.pointerId);
+		} catch {
+			/* synthetic pointer events have no active pointer to capture */
+		}
+
+		// Second finger → pinch zoom; abandon any pan/select gesture in flight.
+		if (activePointers.size === 2) {
+			drag = null;
+			selBox = null;
+			panning = false;
+			selecting = false;
+			const [p1, p2] = [...activePointers.values()];
+			const midX = (p1.x + p2.x) / 2;
+			const midY = (p1.y + p2.y) / 2;
+			const startDist = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+			pinch = { startDist, startK: view.k, midX, midY, startTx: view.tx, startTy: view.ty };
+			suppressTap = true;
+			return;
+		}
+		if (activePointers.size > 2 || pinch) return; // ignore extra fingers mid-pinch
+
 		const mode = event.shiftKey ? 'select' : 'pan';
 		drag = {
 			mode,
@@ -883,22 +983,38 @@
 			ty: view.ty,
 			selStart: [x, y]
 		};
-		try {
-			canvasEl.setPointerCapture(event.pointerId);
-		} catch {
-			/* synthetic pointer events have no active pointer to capture */
-		}
 		panning = mode === 'pan';
 		selecting = mode === 'select';
 		if (mode === 'select') selBox = { x, y, w: 0, h: 0 };
 	}
 
 	function onPointerMove(event: PointerEvent) {
+		if (activePointers.has(event.pointerId)) {
+			const [px, py] = pointerPos(event);
+			activePointers.set(event.pointerId, { x: px, y: py });
+		}
+
+		// Two-finger pinch: scale around the midpoint (and pan with it).
+		if (pinch && activePointers.size >= 2) {
+			const [p1, p2] = [...activePointers.values()];
+			const curMidX = (p1.x + p2.x) / 2;
+			const curMidY = (p1.y + p2.y) / 2;
+			const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+			const k = Math.max(0.02, Math.min(40, pinch.startK * (dist / pinch.startDist)));
+			const wx = (pinch.midX - pinch.startTx) / pinch.startK;
+			const wy = (pinch.midY - pinch.startTy) / pinch.startK;
+			view.k = k;
+			view.tx = curMidX - wx * k;
+			view.ty = curMidY - wy * k;
+			draw();
+			return;
+		}
+
 		const [x, y] = pointerPos(event);
 		if (drag) {
 			const dx = x - drag.startX;
 			const dy = y - drag.startY;
-			if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+			if (Math.hypot(dx, dy) > TAP_SLOP) drag.moved = true;
 			if (drag.mode === 'pan') {
 				view.tx = drag.tx + dx;
 				view.ty = drag.ty + dy;
@@ -921,15 +1037,41 @@
 	}
 
 	function onPointerUp(event: PointerEvent) {
+		activePointers.delete(event.pointerId);
+		const wasPinch = pinch !== null;
+		if (wasPinch) {
+			// Keep suppressing until every finger is up so a pinch never taps.
+			if (activePointers.size < 2) pinch = null;
+			suppressTap = true;
+			panning = false;
+			selecting = false;
+			selBox = null;
+			drag = null;
+			try {
+				canvasEl?.releasePointerCapture(event.pointerId);
+			} catch {
+				/* pointer already released */
+			}
+			return;
+		}
+
 		panning = false;
 		selecting = false;
 		if (drag && drag.mode === 'select' && drag.rect) {
 			finalizeBoxSelect(drag.rect);
+		} else if (drag && drag.mode === 'pan' && !drag.moved && !suppressTap) {
+			// A tap/click (movement below the slop) activates the node under the
+			// pointer; clicking empty space clears the selection.
+			const [x, y] = pointerPos(event);
+			const node = hitTest(x, y);
+			if (node) {
+				select([node.id]);
+				hideTooltip();
+			} else if (selection.size) {
+				select([]);
+			}
 		}
-		if (drag && drag.mode === 'pan' && !drag.moved) {
-			// plain click clears a multi-selection
-			if (selection.size > 1) select([]);
-		}
+		suppressTap = false;
 		selBox = null;
 		drag = null;
 		try {
@@ -939,11 +1081,14 @@
 		}
 	}
 
-	function onPointerCancel() {
+	function onPointerCancel(event: PointerEvent) {
+		activePointers.delete(event.pointerId);
 		panning = false;
 		selecting = false;
 		selBox = null;
 		drag = null;
+		pinch = null;
+		suppressTap = false;
 	}
 
 	function onPointerLeave() {
@@ -953,13 +1098,41 @@
 		draw();
 	}
 
-	function onDoubleClick(event: MouseEvent) {
-		const [x, y] = pointerPos(event);
-		const node = hitTest(x, y);
-		if (node) {
-			select([node.id]);
-			hideTooltip();
+	/** Drag the tree/canvas divider; width is clamped and persisted on release. */
+	function onSplitterDown(event: PointerEvent) {
+		const el = event.currentTarget as HTMLElement;
+		const startX = event.clientX;
+		const startWidth = outlineWidth;
+		event.preventDefault();
+		try {
+			el.setPointerCapture(event.pointerId);
+		} catch {
+			/* synthetic pointer events have no active pointer to capture */
 		}
+		const onMove = (e: PointerEvent) => {
+			outlineWidth = Math.max(
+				OUTLINE_MIN_W,
+				Math.min(OUTLINE_MAX_W, startWidth + (e.clientX - startX))
+			);
+		};
+		const onUp = (e: PointerEvent) => {
+			el.removeEventListener('pointermove', onMove);
+			el.removeEventListener('pointerup', onUp);
+			el.removeEventListener('pointercancel', onUp);
+			try {
+				el.releasePointerCapture(e.pointerId);
+			} catch {
+				/* ignore */
+			}
+			try {
+				localStorage.setItem(OUTLINE_WIDTH_KEY, String(outlineWidth));
+			} catch {
+				/* storage unavailable */
+			}
+		};
+		el.addEventListener('pointermove', onMove);
+		el.addEventListener('pointerup', onUp);
+		el.addEventListener('pointercancel', onUp);
 	}
 
 	function onContextMenu(event: MouseEvent) {
@@ -1062,6 +1235,21 @@
 		if (data.elkStress) {
 			elkPositions = new Map(data.elkStress.positions.map((p) => [p.id, p]));
 		}
+		if (data.forcePositions) {
+			forcePositions = new Map(data.forcePositions.positions.map((p) => [p.id, p]));
+		}
+		try {
+			const savedWidth = Number(localStorage.getItem(OUTLINE_WIDTH_KEY));
+			if (
+				Number.isFinite(savedWidth) &&
+				savedWidth >= OUTLINE_MIN_W &&
+				savedWidth <= OUTLINE_MAX_W
+			) {
+				outlineWidth = savedWidth;
+			}
+		} catch {
+			/* storage unavailable */
+		}
 		if (!canvasEl) return;
 		ctx = canvasEl.getContext('2d');
 
@@ -1106,6 +1294,14 @@
 			labels: () =>
 				(agg?.nodes ?? []).map((n) => ({ id: n.id, name: n.name, label: n.label })),
 			nodeIds: () => (agg?.nodes ?? []).map((n) => n.id),
+			positions: () =>
+				(agg?.nodes ?? []).map((n) => ({
+					id: n.id,
+					x: n.x ?? 0,
+					y: n.y ?? 0,
+					w: n.hw * 2,
+					h: n.hh * 2
+				})),
 			screenPos: (id: string) => {
 				const node = nodeById.get(id);
 				if (!node) return null;
@@ -1143,6 +1339,7 @@
 	{#if !outlineCollapsed}
 		<OutlineTree
 			{graph}
+			width={outlineWidth}
 			selected={selectedKeys}
 			onselect={(ids) => {
 				select(ids);
@@ -1152,15 +1349,15 @@
 			onfocusfile={(id) => void focusFile(id)}
 			onopenlocal={(ids) => openLocal(ids)}
 		/>
+		<div
+			class="splitter"
+			role="separator"
+			aria-orientation="vertical"
+			aria-label="Resize outline"
+			title="drag to resize the outline"
+			onpointerdown={onSplitterDown}
+		></div>
 	{/if}
-	<button
-		class="outline-toggle"
-		title={outlineCollapsed ? 'show outline' : 'hide outline'}
-		aria-label={outlineCollapsed ? 'show outline' : 'hide outline'}
-		onclick={() => (outlineCollapsed = !outlineCollapsed)}
-	>
-		{outlineCollapsed ? '»' : '«'}
-	</button>
 	<div class="stage">
 	<canvas
 		bind:this={canvasEl}
@@ -1171,7 +1368,6 @@
 		onpointerup={onPointerUp}
 		onpointercancel={onPointerCancel}
 		onpointerleave={onPointerLeave}
-		ondblclick={onDoubleClick}
 		oncontextmenu={onContextMenu}
 	></canvas>
 
@@ -1199,7 +1395,7 @@
 			{/each}
 		</div>
 		<div class="group">
-			<button onclick={() => relayout()} title="re-run d3-force in the worker">re-layout</button>
+			<button onclick={() => relayout(true)} title="re-run d3-force live in the worker">re-layout</button>
 			<button
 				onclick={() => {
 					fit();
@@ -1218,6 +1414,17 @@
 			/>
 			<span class="search-count">{searchCount}</span>
 		</div>
+		<div class="group right">
+			<button
+				class="collapse-toggle"
+				title={outlineCollapsed ? 'show outline' : 'hide outline'}
+				aria-label={outlineCollapsed ? 'show outline' : 'hide outline'}
+				aria-expanded={!outlineCollapsed}
+				onclick={() => (outlineCollapsed = !outlineCollapsed)}
+			>
+				{outlineCollapsed ? '»' : '«'}
+			</button>
+		</div>
 		{#if metrics}
 			<div class="metrics">
 				<b>{metrics.level}</b> · <b>{metrics.source}</b> · nodes <b>{metrics.nodes}</b> · edges
@@ -1231,7 +1438,7 @@
 	</div>
 
 	<div class="hint">
-		drag pan · wheel zoom · shift+drag select · / search · arrows move · Enter → Local · j jump · ? help
+		tap/click select · drag pan · wheel / pinch zoom · shift+drag select · / search · arrows move · Enter → Local · j jump · ? help
 	</div>
 
 	{#if tooltip}
@@ -1266,6 +1473,9 @@
 			<div class="help-card">
 				<h3>Keyboard shortcuts</h3>
 				<dl>
+					<dt>click / tap</dt><dd>select the node under the pointer</dd>
+					<dt>drag / touch drag</dt><dd>pan the viewport</dd>
+					<dt>pinch / wheel</dt><dd>zoom in / out</dd>
 					<dt>← ↑ → ↓</dt><dd>move selection to nearest node</dd>
 					<dt>+ / −</dt><dd>zoom in / out</dd>
 					<dt>0</dt><dd>fit graph</dd>
@@ -1291,37 +1501,36 @@
 		display: flex;
 		align-items: stretch;
 		gap: 8px;
+		flex: 1 1 auto;
+		height: 100%;
+		min-height: 0;
 	}
 
 	.workspace .stage {
 		flex: 1 1 auto;
 		min-width: 0;
+		min-height: 0;
 	}
 
-	.outline-toggle {
-		align-self: flex-start;
-		margin-top: 8px;
-		padding: 6px 3px;
-		font: inherit;
-		font-size: 13px;
-		line-height: 1;
-		color: #8b98a8;
-		background: #212a36;
-		border: 1px solid #2a3340;
-		border-radius: 6px;
-		cursor: pointer;
+	.splitter {
+		flex: 0 0 6px;
+		align-self: stretch;
+		border-radius: 3px;
+		background: transparent;
+		cursor: col-resize;
+		touch-action: none;
 	}
 
-	.outline-toggle:hover {
-		color: #ffd54a;
-		border-color: #ffd54a;
+	.splitter:hover,
+	.splitter:active {
+		background: #2a3340;
 	}
 
 	.stage {
 		position: relative;
-		width: 100%;
-		height: calc(100vh - 150px);
-		min-height: 480px;
+		box-sizing: border-box;
+		height: 100%;
+		min-height: 0;
 		overflow: hidden;
 		background: #0e1116;
 		border: 1px solid #2a3340;
@@ -1337,6 +1546,8 @@
 		height: 100%;
 		display: block;
 		cursor: grab;
+		/* Pointer Events own pan/pinch; disable native scroll-zoom gestures. */
+		touch-action: none;
 	}
 
 	canvas.panning {
@@ -1367,6 +1578,16 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
+	}
+
+	.group.right {
+		margin-left: auto;
+	}
+
+	.collapse-toggle {
+		min-width: 28px;
+		font-size: 13px;
+		line-height: 1;
 	}
 
 	.title {
