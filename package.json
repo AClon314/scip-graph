@@ -11,6 +11,7 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"derive": "bun scripts/derive-graph.ts",
+		"precompute:elk": "bun scripts/precompute-elk.ts",
 		"scip-graph": "bun src/bin/scip-graph.ts",
 		"test": "bun test"
 	},
@@ -21,6 +22,7 @@
 		"@types/bun": "^1.4.2",
 		"@types/d3-force": "^3.0.10",
 		"@types/node": "^26.6.3",
+		"elkjs": "^0.12.0",
 		"svelte": "^5.56.1",
 		"svelte-check": "^4.6.0",
 		"typescript": "^6.0.3",
