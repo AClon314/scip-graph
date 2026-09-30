@@ -163,29 +163,6 @@ export function indexOutline(root: OutlineNode): OutlineIndex {
   return { byId, parent, symbolById };
 }
 
-/** All symbol ids under a node (the whole file/dir subtree for non-leaves). */
-export function collectSymbolIds(node: OutlineNode): string[] {
-  const ids: string[] = [];
-  const stack: OutlineNode[] = [node];
-  while (stack.length) {
-    const current = stack.pop() as OutlineNode;
-    if (current.kind === 'symbol' && current.symbol) ids.push(current.symbol.id);
-    else for (const child of current.children) stack.push(child);
-  }
-  return ids.reverse();
-}
-
-/** First symbol id in document order, or `null` for an empty subtree. */
-export function firstSymbolId(node: OutlineNode): string | null {
-  const stack: OutlineNode[] = [node];
-  while (stack.length) {
-    const current = stack.pop() as OutlineNode;
-    if (current.kind === 'symbol') return current.symbol?.id ?? null;
-    for (let i = current.children.length - 1; i >= 0; i--) stack.push(current.children[i]);
-  }
-  return null;
-}
-
 /** Ancestor node ids for a raw symbol id, nearest (file) first. */
 export function ancestorsOfSymbol(index: OutlineIndex, symbolId: string): string[] {
   const symbol = index.symbolById.get(symbolId);
