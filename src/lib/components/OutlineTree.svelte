@@ -13,7 +13,6 @@
 	import {
 		ancestorsOfSymbol,
 		buildOutline,
-		collectSymbolIds,
 		filterOutline,
 		indexOutline,
 		visibleRows,
@@ -23,6 +22,7 @@
 	let {
 		graph = null,
 		selected = [],
+		width = 300,
 		onselect,
 		onfocussymbol,
 		onfocusfile,
@@ -30,6 +30,8 @@
 	}: {
 		graph?: SgGraph | null;
 		selected?: string[];
+		/** Sidebar width in px, owned by the page so it can be resized + persisted. */
+		width?: number;
 		onselect?: (ids: string[]) => void;
 		onfocussymbol?: (id: string) => void;
 		onfocusfile?: (id: string) => void;
@@ -124,9 +126,10 @@
 		toggle(node);
 	}
 
-	function openLocal(node: OutlineNode) {
-		const ids = collectSymbolIds(node);
-		if (ids.length) onopenlocal?.(ids);
+	/** Compact kind tag for a row (`Function`, `file`, `dir`, …). */
+	function kindLabel(node: OutlineNode): string {
+		if (node.kind === 'symbol') return node.symbol?.kind ?? 'symbol';
+		return node.kind;
 	}
 
 	function onFilterKey(event: KeyboardEvent) {
@@ -150,7 +153,7 @@
 	}
 </script>
 
-<aside class="outline" aria-label="Repository outline">
+<aside class="outline" style={`width:${width}px`} aria-label="Repository outline">
 	<div class="head">
 		<input
 			id="outline-search-input"
@@ -214,17 +217,8 @@
 				{#if row.node.kind === 'symbol' && row.node.symbol}
 					<span class="line">:{row.node.symbol.line}</span>
 				{/if}
+				<span class="kind">{kindLabel(row.node)}</span>
 				<span class="count">{row.node.count}</span>
-				{#if row.node.kind !== 'repo' && row.node.count > 0}
-					<button
-						class="open"
-						title={`open ${row.node.count} symbol(s) in Local`}
-						onclick={(event) => {
-							event.stopPropagation();
-							openLocal(row.node);
-						}}>Local</button
-					>
-				{/if}
 			</div>
 		{:else}
 			<p class="empty">No graph loaded.</p>
@@ -239,10 +233,11 @@
 	.outline {
 		display: flex;
 		flex-direction: column;
-		width: 300px;
-		min-width: 220px;
-		height: calc(100vh - 150px);
-		min-height: 480px;
+		flex: 0 0 auto;
+		box-sizing: border-box;
+		min-width: 0;
+		height: 100%;
+		min-height: 0;
 		overflow: hidden;
 		color: #d5dde8;
 		background: #0e1116;
@@ -303,11 +298,10 @@
 
 	.row {
 		display: flex;
-		align-items: center;
+		align-items: baseline;
 		gap: 6px;
 		padding: 2px 8px;
 		cursor: pointer;
-		white-space: nowrap;
 	}
 
 	.row:hover {
@@ -341,41 +335,34 @@
 	}
 
 	.twisty {
+		flex: 0 0 auto;
 		width: 1ch;
 		color: #8b98a8;
 	}
 
 	.label {
-		overflow: hidden;
-		text-overflow: ellipsis;
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 
 	.line {
+		flex: 0 0 auto;
 		color: #6f7b8a;
+	}
+
+	.kind {
+		flex: 0 0 auto;
+		color: #6f7b8a;
+		font-size: 10px;
+		opacity: 0.75;
 	}
 
 	.count {
-		margin-left: auto;
-		padding: 0 4px;
+		flex: 0 0 auto;
+		padding: 0 2px;
 		color: #6f7b8a;
 		font-size: 11px;
-	}
-
-	.open {
-		font: inherit;
-		font-size: 10px;
-		padding: 1px 5px;
-		color: #1a1a1a;
-		background: #ffd54a;
-		border: none;
-		border-radius: 4px;
-		cursor: pointer;
-		opacity: 0.35;
-	}
-
-	.row:hover .open,
-	.row.selected .open {
-		opacity: 1;
 	}
 
 	.empty {
