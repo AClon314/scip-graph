@@ -10,6 +10,7 @@
 
 import type { Aggregation, Level } from './aggregate';
 import { computeMetrics } from './metrics';
+import { separateRects } from './rect-separation';
 import type { LayoutParams, LayoutRequest, LayoutResponse } from './layout.worker';
 
 /** Simulation ticks per level (matches the offline precompute). */
@@ -116,9 +117,16 @@ export function applyPrecomputed(
 ): GlobalMetrics {
 	const t0 = performance.now();
 	applyPositions(agg, positions);
-	const derived = computeMetrics(
-		agg.nodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, hw: n.hw, hh: n.hh }))
-	);
+	// Re-run rect separation against the *current* node sizes: the precompute
+	// sized nodes for its own `sizeByDegree` mode, so loading with a different
+	// size mode can reintroduce overlaps. A no-op pass when the sizes match.
+	const rects = agg.nodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, hw: n.hw, hh: n.hh }));
+	const extraPasses = separateRects(rects);
+	agg.nodes.forEach((n, i) => {
+		n.x = rects[i].x;
+		n.y = rects[i].y;
+	});
+	const derived = computeMetrics(rects);
 	return {
 		level: 'symbol',
 		source,
@@ -128,7 +136,7 @@ export function applyPrecomputed(
 		nodeOverlapRatio: derived.nodeOverlapRatio,
 		nodeOverlapPairs: derived.nodeOverlapPairs,
 		fillNet: Math.round(derived.fillNet * 1e4) / 1e4,
-		cleanupPasses,
+		cleanupPasses: cleanupPasses + extraPasses,
 		overlapsBeforeCleanup: 0,
 		overlapsAfterCleanup: derived.nodeOverlapPairs,
 		precomputeMs

@@ -21,6 +21,7 @@
 	import GlobalHelp from '$lib/components/GlobalHelp.svelte';
 	import {
 		aggregate,
+		levelIdSets,
 		LEVELS,
 		type AggNode,
 		type Aggregation,
@@ -60,13 +61,19 @@
 		type SymbolMaps
 	} from '$lib/global/handoff';
 	import {
-		isTypingTarget,
 		nearestInDirection,
 		nearestToCenter,
 		type Direction
 	} from '$lib/global/keyboard';
 	import { createPointerController } from '$lib/global/pointer';
 	import { drawScene } from '$lib/global/render';
+	import { writeSelectionToUrl } from '$lib/global/selection-url';
+	import { countSelectionNeighbors } from '$lib/global/neighbors';
+	import { reaggregateForSize } from '$lib/global/size-mode';
+	import { applyBootstrapSelection } from '$lib/global/preselect';
+	import { handleGlobalKey } from '$lib/global/keys';
+	import { animateSelection } from '$lib/global/handoff-anim';
+	import './global.css';
 	import { createGlobalDebug, type GlobalDebugApi } from '$lib/global/debug';
 	import { handleSplitterDrag } from '$lib/global/splitter';
 	import { matchNodes } from '$lib/global/search';
@@ -85,6 +92,8 @@
 	const OUTLINE_WIDTH_KEY = 'gpen.scip.outlineWidth';
 	const OUTLINE_MIN_W = 200;
 	const OUTLINE_MAX_W = 760;
+	/** Persisted toggle: scale node rects by call degree (default on). */
+	const SIZE_BY_DEGREE_KEY = 'gpen.scip.sizeByDegree';
 
 	// --- non-reactive scene state (canvas render loop) -----------------------
 	let graph = $state.raw<SgGraph | null>(null);
@@ -133,6 +142,12 @@
 	let outlineCollapsed = $state(false);
 	/** Sidebar width in px (drag the splitter to resize; persisted below). */
 	let outlineWidth = $state(300);
+	/** Size node rectangles by call degree (in + out); persisted to localStorage. */
+	let sizeByDegree = $state(true);
+	/** Suppresses URL writes while bootstrap applies a persisted selection. */
+	let suppressUrlSync = false;
+	/** Node-id sets per level, used to resolve a persisted selection's level. */
+	let idsByLevel: Record<Level, Set<string>> | null = null;
 	let helpOpen = $state(false);
 	/** Reactive mirror of the canvas selection for the outline sidebar. */
 	let selectedKeys = $state<string[]>([]);
@@ -147,29 +162,7 @@
 		// Read `level` so the derived re-runs whenever the aggregation is rebuilt
 		// for a new level, even when the selected ids are unchanged (keepSelection).
 		void level;
-		if (!selectedKeys.length || !agg) return { callers: 0, callees: 0, edges: 0 };
-		const set = new Set(selectedKeys);
-		const seenCallers = new Set<string>();
-		const seenCallees = new Set<string>();
-		let callers = 0;
-		let callees = 0;
-		let edges = 0;
-		for (const e of agg.edges) {
-			const srcIn = set.has(e.source);
-			const dstIn = set.has(e.target);
-			if (srcIn === dstIn) continue;
-			edges++;
-			if (dstIn) {
-				if (!seenCallers.has(e.source)) {
-					seenCallers.add(e.source);
-					callers++;
-				}
-			} else if (!seenCallees.has(e.target)) {
-				seenCallees.add(e.target);
-				callees++;
-			}
-		}
-		return { callers, callees, edges };
+		return countSelectionNeighbors(agg, selectedKeys);
 	});
 
 	// -------------------------------------------------------------------------
@@ -213,12 +206,13 @@
 	function updateSelectionUi() {
 		selectionCount = selection.size;
 		selectedKeys = [...selection];
+		syncSelectionUrl();
 	}
 
 	async function relayout(forceLive = false): Promise<GlobalMetrics | undefined> {
 		if (!graph) return;
 		const token = ++layoutToken;
-		agg = aggregate(graph, level);
+		agg = aggregate(graph, level, { sizeByDegree });
 		nodeById = new Map(agg.nodes.map((n) => [n.id, n]));
 		if (layoutMode === 'elk-stress' && level === 'symbol' && elkPositions && covers(elkPositions, agg)) {
 			// Precomputed positions: no worker round-trip, no 6 s wait.
@@ -298,6 +292,53 @@
 		view.ty = next.ty;
 	}
 
+	/**
+	 * Re-aggregate for the current `sizeByDegree` without a full relayout: reuse
+	 * the existing positions, re-separate the resized rects (keeping
+	 * `nodeOverlapRatio === 0`) and refresh the metrics. Falls back to a normal
+	 * `relayout()` only when no positions exist yet.
+	 */
+	function applySizeByDegree(): void {
+		if (!graph || !agg) return;
+		const prev = new Map<string, { x: number; y: number }>();
+		for (const n of agg.nodes) {
+			if (n.x !== undefined && n.y !== undefined) prev.set(n.id, { x: n.x, y: n.y });
+		}
+		const next = reaggregateForSize(graph, level, sizeByDegree, prev);
+		if (!next) {
+			void relayout();
+			return;
+		}
+		agg = next.agg;
+		nodeById = new Map(agg.nodes.map((n) => [n.id, n]));
+		const derived = next.metrics;
+		if (metrics) {
+			metrics = {
+				...metrics,
+				level,
+				nodes: agg.nodes.length,
+				edges: agg.edges.length,
+				nodeOverlapRatio: derived.nodeOverlapRatio,
+				nodeOverlapPairs: derived.nodeOverlapPairs,
+				fillNet: Math.round(derived.fillNet * 1e4) / 1e4
+			};
+		}
+		fit();
+		draw();
+	}
+
+	/** Persist and apply the size-by-degree toggle (re-aggregates in place). */
+	function setSizeByDegree(value: boolean): void {
+		if (value === sizeByDegree) return;
+		sizeByDegree = value;
+		try {
+			localStorage.setItem(SIZE_BY_DEGREE_KEY, value ? '1' : '0');
+		} catch {
+			/* storage unavailable */
+		}
+		applySizeByDegree();
+	}
+
 	// -------------------------------------------------------------------------
 	// rendering
 	// -------------------------------------------------------------------------
@@ -346,6 +387,16 @@
 		return [...selection];
 	}
 
+	/**
+	 * Mirror the current selection into the URL's `selected` query param (a JSON
+	 * string array). The write is skipped while bootstrap is applying a persisted
+	 * selection; `writeSelectionToUrl` preserves every other query param.
+	 */
+	function syncSelectionUrl(): void {
+		if (suppressUrlSync) return;
+		writeSelectionToUrl([...selection]);
+	}
+
 	// --- focus / centering ---------------------------------------------------
 	function centerOn(id: string, zoom?: number): boolean {
 		const node = nodeById.get(id);
@@ -358,6 +409,23 @@
 		view.ty = ch / 2 - (node.y ?? 0) * k;
 		draw();
 		return true;
+	}
+
+	/** Zoom the viewport to frame the current selection (with a little padding). */
+	function focusSelection(pad = 120): void {
+		if (!canvasEl) return;
+		const bounds = selectionBounds(selection, nodeById);
+		if (!bounds) return;
+		// Inflate tiny selections so a single small node is not blown up to max zoom.
+		const target = zoomToBounds(
+			{ ...bounds, w: Math.max(bounds.w, 240), h: Math.max(bounds.h, 160) },
+			canvasEl.clientWidth,
+			canvasEl.clientHeight,
+			pad
+		);
+		view.k = target.k;
+		view.tx = target.tx;
+		view.ty = target.ty;
 	}
 
 	/** Select + centre a node, switching to the level that owns its id. */
@@ -392,45 +460,6 @@
 		return agg ? hitTest(agg, view, sx, sy) : null;
 	}
 
-	/**
-	 * Briefly zoom + glow the current selection so the handoff reads as a
-	 * continuation rather than a jump cut. Runs `run` once the animation ends;
-	 * falls back to an immediate call when there is nothing to animate.
-	 */
-	async function animateSelection(run: () => void): Promise<void> {
-		const bounds = selectionBounds(selection, nodeById);
-		const target =
-			bounds && canvasEl
-				? zoomToBounds(bounds, canvasEl.clientWidth, canvasEl.clientHeight)
-				: null;
-		if (!target || !canvasEl) {
-			run();
-			return;
-		}
-		const start = { k: view.k, tx: view.tx, ty: view.ty };
-		const dur = 240;
-		const t0 = performance.now();
-		await new Promise<void>((resolve) => {
-			const step = (now: number) => {
-				const t = Math.min(1, (now - t0) / dur);
-				const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-				view.k = start.k + (target.k - start.k) * e;
-				view.tx = start.tx + (target.tx - start.tx) * e;
-				view.ty = start.ty + (target.ty - start.ty) * e;
-				elevate = Math.sin(Math.PI * t);
-				draw();
-				if (t < 1) requestAnimationFrame(step);
-				else {
-					elevate = 0;
-					draw();
-					resolve();
-				}
-			};
-			requestAnimationFrame(step);
-		});
-		run();
-	}
-
 	/** Persist the selection and navigate to Local, with a short pre-animation. */
 	function openLocal(ids?: string[]): void {
 		if (navigating) return;
@@ -439,13 +468,23 @@
 		const capped = capHandoff(symbols);
 		persistHandoff(capped);
 		navigating = true;
-		void animateSelection(() => {
-			void goto('/local?ids=' + capped.join(','))
-				.catch(() => undefined)
-				.finally(() => {
-					navigating = false;
-				});
-		});
+		void animateSelection(
+			{
+				view,
+				selection,
+				nodeById,
+				canvas: canvasEl,
+				draw,
+				setElevate: (value) => (elevate = value)
+			},
+			() => {
+				void goto('/local?ids=' + capped.join(','))
+					.catch(() => undefined)
+					.finally(() => {
+						navigating = false;
+					});
+			}
+		);
 	}
 
 	// --- keyboard navigation -------------------------------------------------
@@ -503,67 +542,24 @@
 	}
 
 	function onKeyDown(event: KeyboardEvent): void {
-		if (event.key === 'Escape') {
-			if (helpOpen) {
-				helpOpen = false;
-				return;
-			}
-			if (isTypingTarget(event.target)) return;
-			if (selection.size) {
+		handleGlobalKey(event, {
+			helpOpen: () => helpOpen,
+			closeHelp: () => (helpOpen = false),
+			hasSelection: () => selection.size > 0,
+			clearSelection: () => {
 				select([]);
 				draw();
-			}
-			return;
-		}
-		if (isTypingTarget(event.target)) return;
-		const key = event.key;
-		if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown') {
-			event.preventDefault();
-			moveSelection(
-				key === 'ArrowLeft'
-					? 'left'
-					: key === 'ArrowRight'
-						? 'right'
-						: key === 'ArrowUp'
-							? 'up'
-							: 'down'
-			);
-			return;
-		}
-		if (key === '+' || key === '=') {
-			event.preventDefault();
-			zoomBy(1.2);
-			return;
-		}
-		if (key === '-' || key === '_') {
-			event.preventDefault();
-			zoomBy(1 / 1.2);
-			return;
-		}
-		if (key === '0') {
-			event.preventDefault();
-			fitView();
-			return;
-		}
-		if (key === '/') {
-			event.preventDefault();
-			focusOutlineSearch();
-			return;
-		}
-		if (key === '?') {
-			event.preventDefault();
-			helpOpen = !helpOpen;
-			return;
-		}
-		if (key === 'Enter') {
-			event.preventDefault();
-			if (selection.size) openLocal([...selection]);
-			return;
-		}
-		if (key === 'j' || key === 'J') {
-			event.preventDefault();
-			jumpCurrent();
-		}
+			},
+			moveSelection,
+			zoomBy,
+			fitView,
+			focusSearch: focusOutlineSearch,
+			toggleHelp: () => (helpOpen = !helpOpen),
+			openLocal: () => {
+				if (selection.size) openLocal([...selection]);
+			},
+			jumpCurrent
+		});
 	}
 
 	// -------------------------------------------------------------------------
@@ -638,27 +634,40 @@
 	// -------------------------------------------------------------------------
 	async function bootstrap() {
 		const params = new URLSearchParams(location.search);
-		const idsParam = params.get('ids');
-		let preselected: string[] | null = idsParam ? idsParam.split(',').filter(Boolean) : null;
-		if (!preselected) {
-			try {
-				const saved = JSON.parse(localStorage.getItem(HANDOFF_KEY) || 'null');
-				if (saved && Array.isArray(saved.ids) && saved.ids.length) preselected = saved.ids;
-			} catch {
-				/* ignore malformed handoff */
-			}
+		let handoff: string[] | null = null;
+		try {
+			const saved = JSON.parse(localStorage.getItem(HANDOFF_KEY) || 'null');
+			if (saved && Array.isArray(saved.ids) && saved.ids.length) handoff = saved.ids;
+		} catch {
+			/* ignore malformed handoff */
 		}
-		await setLevel(preselected ? 'symbol' : 'dir');
-		if (preselected) {
-			select(preselected.filter((id) => nodeById.has(id)));
-			fit();
-			draw();
+		// Suppress URL writes while applying the persisted selection, then
+		// normalise once at the end so a stale `selected` is never left behind.
+		suppressUrlSync = true;
+		try {
+			await applyBootstrapSelection({
+				selectedParam: params.get('selected'),
+				idsParam: params.get('ids'),
+				handoff,
+				levelSets: idsByLevel,
+				setLevel,
+				selectExisting: (ids) => select(ids.filter((id) => nodeById.has(id))),
+				focusSelection,
+				fit,
+				draw
+			});
+		} finally {
+			suppressUrlSync = false;
 		}
+		syncSelectionUrl();
 	}
 
 	onMount(() => {
 		graph = data.graph;
-		if (graph) symbolMaps = buildSymbolMaps(graph);
+		if (graph) {
+			symbolMaps = buildSymbolMaps(graph);
+			idsByLevel = levelIdSets(graph);
+		}
 		if (data.elkStress) {
 			elkPositions = new Map(data.elkStress.positions.map((p) => [p.id, p]));
 		}
@@ -674,6 +683,8 @@
 			) {
 				outlineWidth = savedWidth;
 			}
+			const savedSize = localStorage.getItem(SIZE_BY_DEGREE_KEY);
+			if (savedSize !== null) sizeByDegree = savedSize !== '0';
 		} catch {
 			/* storage unavailable */
 		}
@@ -796,9 +807,11 @@
 			{level}
 			{searchCount}
 			{outlineCollapsed}
+			{sizeByDegree}
 			{metrics}
 			onsetlayoutmode={(mode) => void setLayoutMode(mode)}
 			onsetlevel={(lv) => void setLevel(lv)}
+			ontogglesizedegree={setSizeByDegree}
 			onrelayout={() => void relayout(true)}
 			onfit={() => {
 				fit();
@@ -856,176 +869,3 @@
 	</div>
 </div>
 
-<style>
-	:global(body) {
-		background: #f6f7f9;
-	}
-
-	.workspace {
-		display: flex;
-		align-items: stretch;
-		gap: 8px;
-		flex: 1 1 auto;
-		height: 100%;
-		min-height: 0;
-	}
-
-	.workspace .stage {
-		flex: 1 1 auto;
-		min-width: 0;
-		min-height: 0;
-	}
-
-	.splitter {
-		flex: 0 0 6px;
-		align-self: stretch;
-		border-radius: 3px;
-		background: transparent;
-		cursor: col-resize;
-		touch-action: none;
-	}
-
-	.splitter:hover,
-	.splitter:active {
-		background: #2a3340;
-	}
-
-	.stage {
-		position: relative;
-		box-sizing: border-box;
-		height: 100%;
-		min-height: 0;
-		overflow: hidden;
-		background: #0e1116;
-		border: 1px solid #2a3340;
-		border-radius: 10px;
-		color: #d5dde8;
-		font: 12px / 1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-	}
-
-	canvas {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		display: block;
-		cursor: grab;
-		/* Pointer Events own pan/pinch; disable native scroll-zoom gestures. */
-		touch-action: none;
-	}
-
-	canvas.panning {
-		cursor: grabbing;
-	}
-
-	canvas.selecting {
-		cursor: crosshair;
-	}
-
-	button {
-		font: inherit;
-		color: #d5dde8;
-		background: #212a36;
-		border: 1px solid #2a3340;
-		border-radius: 6px;
-		padding: 3px 9px;
-		cursor: pointer;
-	}
-
-	button:hover {
-		border-color: #ffd54a;
-	}
-
-	.hint {
-		position: absolute;
-		bottom: 10px;
-		left: 10px;
-		padding: 4px 8px;
-		color: #8b98a8;
-		background: #171c24cc;
-		border: 1px solid #2a3340;
-		border-radius: 6px;
-	}
-
-	.tooltip {
-		position: absolute;
-		z-index: 5;
-		max-width: 52ch;
-		padding: 7px 9px;
-		background: #0b0f14f2;
-		border: 1px solid #2a3340;
-		border-radius: 6px;
-		pointer-events: none;
-		white-space: pre-wrap;
-		word-break: break-word;
-	}
-
-	.tt-title {
-		color: #ffd54a;
-	}
-
-	.tt-muted {
-		color: #8b98a8;
-	}
-
-	.sel-actions {
-		position: absolute;
-		right: 14px;
-		bottom: 14px;
-		z-index: 6;
-		display: flex;
-		align-items: center;
-		gap: 10px;
-	}
-
-	.sel-status {
-		padding: 5px 10px;
-		font-size: 12px;
-		font-variant-numeric: tabular-nums;
-		color: #cbd5e1;
-		background: #171c24cc;
-		border: 1px solid #2a3340;
-		border-radius: 6px;
-		white-space: nowrap;
-	}
-
-	.jump {
-		padding: 8px 14px;
-		font-size: 13px;
-		font-weight: 700;
-		color: #1a1a1a;
-		background: #ffd54a;
-		border-color: #ffd54a;
-	}
-
-	.status {
-		position: absolute;
-		top: 50%;
-		left: 50%;
-		transform: translate(-50%, -50%);
-		padding: 10px 16px;
-		color: #d5dde8;
-		background: #171c24cc;
-		border: 1px solid #2a3340;
-		border-radius: 8px;
-	}
-
-	.toast {
-		position: absolute;
-		left: 50%;
-		bottom: 56px;
-		transform: translateX(-50%);
-		padding: 6px 12px;
-		color: #1a1a1a;
-		background: #ffd54a;
-		border-radius: 6px;
-		font-weight: 700;
-	}
-
-	.selbox {
-		position: absolute;
-		border: 1px dashed #ffd54a;
-		background: #ffd54a22;
-		pointer-events: none;
-	}
-</style>

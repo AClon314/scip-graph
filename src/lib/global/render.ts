@@ -124,6 +124,16 @@ export function drawScene(
 	const showLabels = agg.nodes.length <= 400 || k > 0.12;
 	ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
 	ctx.textBaseline = 'middle';
+	/** Selected/hovered nodes too small for an inline label get a chip after the loop. */
+	type LabelChip = {
+		sx: number;
+		sy: number;
+		ry: number;
+		h: number;
+		label: string;
+		selected: boolean;
+	};
+	const chips: LabelChip[] = [];
 	for (const node of agg.nodes) {
 		const [sx, sy] = worldToScreen(view, node.x ?? 0, node.y ?? 0);
 		const w = node.hw * 2 * k;
@@ -167,16 +177,44 @@ export function drawScene(
 			ctx.strokeStyle = selected ? '#ffd54a' : hovered ? '#ffffff' : '#0b0f14';
 			ctx.stroke();
 		}
+		// Symbol labels show the real function name (never the line number).
+		const label = level === 'symbol' ? (node.name ?? node.label) : node.label;
 		if (showLabels && w > 30 && h > 10) {
-			// Symbol labels show the real function name (never the line number).
-			const label = level === 'symbol' ? (node.name ?? node.label) : node.label;
 			const text = String(label);
 			const maxChars = Math.max(1, Math.floor((w - 8) / 6.4));
 			const clipped = text.length > maxChars ? text.slice(0, maxChars - 1) + '…' : text;
 			ctx.fillStyle = '#0b0f14';
 			ctx.globalAlpha = dim ? 0.15 : 0.9;
 			ctx.fillText(clipped, rx + 4, sy + 0.5);
+		} else if (selected || hovered) {
+			// Selected/hovered labels must never disappear. When the rect is too
+			// small (or zoomed out) for an inline label, collect a chip that is
+			// drawn at a fixed readable screen size on top of every node.
+			chips.push({ sx, sy, ry, h, label: String(label), selected });
 		}
+	}
+	// Label chips — fixed ~11px screen font, clamped to the canvas, always visible.
+	for (const chip of chips) {
+		const text = chip.label.length > 48 ? chip.label.slice(0, 47) + '…' : chip.label;
+		const tw = ctx.measureText(text).width;
+		const padX = 5;
+		const chipW = tw + padX * 2;
+		const chipH = 15;
+		let cx = chip.sx - chipW / 2;
+		let cy = chip.ry - chipH - 2; // above the node by default
+		if (cy < 2) cy = chip.ry + chip.h + 2; // fall below when it would clip
+		cx = Math.max(2, Math.min(cw - chipW - 2, cx));
+		cy = Math.max(2, Math.min(ch - chipH - 2, cy));
+		ctx.globalAlpha = 1;
+		ctx.fillStyle = '#0b0f14';
+		ctx.beginPath();
+		ctx.roundRect(cx, cy, chipW, chipH, 3);
+		ctx.fill();
+		ctx.lineWidth = chip.selected ? 2 : 1;
+		ctx.strokeStyle = chip.selected ? '#ffd54a' : '#ffffff';
+		ctx.stroke();
+		ctx.fillStyle = chip.selected ? '#ffd54a' : '#d5dde8';
+		ctx.fillText(text, cx + padX, cy + chipH / 2 + 0.5);
 	}
 	ctx.globalAlpha = 1;
 }
