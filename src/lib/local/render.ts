@@ -16,7 +16,18 @@ export type RendererHandlers = {
 
 export type HitResult = { item: LocalItem; column: LocalColumn; box: Box };
 
+/** Focus ring target, surfaced through `window.__local.focus()`. */
+export type FocusInfo = {
+	uid: string;
+	id: string;
+	name: string;
+	file: string;
+	line: number;
+	column: string;
+};
+
 type Box = { it: LocalItem; x: number; y: number; w: number; h: number };
+type Pt = { x: number; y: number };
 type Geo = {
 	col: LocalColumn;
 	x: number;
@@ -38,6 +49,13 @@ const GAP_X = 104;
 const CONTENT_TOP = 58;
 const CONTENT_BOTTOM = 34;
 
+// Crossing hops (visual only). Sample the drawn beziers, find crossings, then
+// bridge one edge of each crossing with a near-semicircle bump.
+const HOP_SAMPLES = 16;
+const HOP_DRAW_SAMPLES = 32;
+const HOP_BRIDGE = 9;
+const HOP_MIN_T = 0.06;
+
 const COLORS = {
 	bg: '#0e1116',
 	header: '#8ea0b8',
@@ -47,6 +65,7 @@ const COLORS = {
 	nodeCenter: '#2b2138',
 	nodeStroke: '#3c4c62',
 	centerStroke: '#b98cff',
+	focusRing: '#ffd479',
 	text: '#dbe4f0',
 	muted: '#7f8fa4',
 	hover: '#f4f8ff',
@@ -85,6 +104,8 @@ export function createRenderer(
 	let zoomTarget = 0.92;
 	let hoverUid: string | null = null;
 	let hoverPlus = false;
+	let focusUid: string | null = null;
+	let lastHopCount = 0;
 	let cssW = 1;
 	let cssH = 1;
 	let raf: number | null = null;
@@ -208,21 +229,163 @@ export function createRenderer(
 		ctx.fill();
 	}
 
-	function drawEdge(rec: LocalLink, boxes: Map<string, Box>, opts: LocalOptions): void {
+	type Path = { p0: Pt; p1: Pt; p2: Pt; p3: Pt; internal: boolean };
+
+	function edgePath(rec: LocalLink, boxes: Map<string, Box>): Path | null {
 		const a = boxes.get(rec.from.uid);
 		const b = boxes.get(rec.to.uid);
-		if (!a || !b) return;
-		const ay = a.y + a.h / 2;
-		const by = b.y + b.h / 2;
+		if (!a || !b) return null;
+		const p0 = { x: a.x + a.w, y: a.y + a.h / 2 };
+		const p3 = rec.internal ? { x: b.x + b.w, y: b.y + b.h / 2 } : { x: b.x, y: b.y + b.h / 2 };
+		const dx = rec.internal ? 52 * zoom : Math.max(22, Math.abs(p3.x - p0.x) * 0.42);
+		return {
+			p0,
+			p1: { x: p0.x + dx, y: p0.y },
+			p2: { x: rec.internal ? p3.x + dx : p3.x - dx, y: p3.y },
+			p3,
+			internal: rec.internal
+		};
+	}
+
+	function bezierAt(p0: Pt, p1: Pt, p2: Pt, p3: Pt, t: number): Pt {
+		const u = 1 - t;
+		const a = u * u * u;
+		const b = 3 * u * u * t;
+		const c = 3 * u * t * t;
+		const d = t * t * t;
+		return { x: a * p0.x + b * p1.x + c * p2.x + d * p3.x, y: a * p0.y + b * p1.y + c * p2.y + d * p3.y };
+	}
+
+	function samplePath(path: Path, n: number, off = 0): Pt[] {
+		const pts: Pt[] = [];
+		for (let i = 0; i <= n; i++) {
+			const pt = bezierAt(path.p0, path.p1, path.p2, path.p3, i / n);
+			pts.push({ x: pt.x, y: pt.y + off });
+		}
+		return pts;
+	}
+
+	// Bridge the hopping curve over a crossing with a near-semicircle bump.
+	// `a` is the current point; the cubic bulges to the smaller-y side.
+	function drawBump(a: Pt, b: Pt): void {
+		const dx = b.x - a.x;
+		const dy = b.y - a.y;
+		const len = Math.hypot(dx, dy) || 1;
+		let nx = -dy / len;
+		let ny = dx / len;
+		if (ny > 0) {
+			nx = -nx;
+			ny = -ny;
+		}
+		const k = (2 / 3) * len;
+		ctx.bezierCurveTo(a.x + nx * k, a.y + ny * k, b.x + nx * k, b.y + ny * k, b.x, b.y);
+	}
+
+	// Draw a sampled bezier as a polyline, replacing each hop with a bump.
+	function strokePathWithHops(pts: Pt[], ts: number[]): void {
+		const n = pts.length;
+		let pathLen = 0;
+		for (let i = 1; i < n; i++) pathLen += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+		const segLen = pathLen / Math.max(1, n - 1) || 1;
+		const w = clamp(Math.round(HOP_BRIDGE / segLen), 1, 8);
+		const idxs = [...new Set(ts.map((t) => clamp(Math.round(t * (n - 1)), 1, n - 2)))].sort((a, b) => a - b);
+		ctx.beginPath();
+		ctx.moveTo(pts[0].x, pts[0].y);
+		let cur = 0;
+		for (const k of idxs) {
+			const a = Math.max(cur, k - w);
+			const b = Math.min(n - 1, k + w);
+			if (b <= a) continue;
+			for (let i = cur + 1; i <= a; i++) ctx.lineTo(pts[i].x, pts[i].y);
+			drawBump(pts[a], pts[b]);
+			cur = b;
+		}
+		for (let i = cur + 1; i < n; i++) ctx.lineTo(pts[i].x, pts[i].y);
+		ctx.stroke();
+	}
+
+	function segIntersect(a: Pt, b: Pt, c: Pt, d: Pt): { t: number; u: number; x: number; y: number } | null {
+		const rx = b.x - a.x;
+		const ry = b.y - a.y;
+		const sx = d.x - c.x;
+		const sy = d.y - c.y;
+		const denom = rx * sy - ry * sx;
+		if (Math.abs(denom) < 1e-9) return null;
+		const qx = c.x - a.x;
+		const qy = c.y - a.y;
+		const t = (qx * sy - qy * sx) / denom;
+		const u = (qx * ry - qy * rx) / denom;
+		if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+		return { t, u, x: a.x + t * rx, y: a.y + t * ry };
+	}
+
+	type HopRec = { rec: LocalLink; pts: Pt[]; minX: number; minY: number; maxX: number; maxY: number };
+
+	// Pure visual crossing detection on the drawn geometry. Samples every
+	// non-internal bezier, then marks the later-drawn edge of each crossing
+	// pair to hop over. Never feeds back into layout or metrics.
+	function computeHops(edges: LocalLink[], boxes: Map<string, Box>): Map<string, number[]> {
+		const out = new Map<string, number[]>();
+		const recs: HopRec[] = [];
+		for (const rec of edges) {
+			if (rec.internal) continue; // self-loops near the centre are left alone
+			const path = edgePath(rec, boxes);
+			if (!path) continue;
+			const pts = samplePath(path, HOP_SAMPLES);
+			let minX = Infinity;
+			let minY = Infinity;
+			let maxX = -Infinity;
+			let maxY = -Infinity;
+			for (const p of pts) {
+				if (p.x < minX) minX = p.x;
+				if (p.x > maxX) maxX = p.x;
+				if (p.y < minY) minY = p.y;
+				if (p.y > maxY) maxY = p.y;
+			}
+			recs.push({ rec, pts, minX, minY, maxX, maxY });
+		}
+		for (let i = 0; i < recs.length; i++) {
+			for (let j = i + 1; j < recs.length; j++) {
+				const a = recs[i];
+				const b = recs[j];
+				// edges sharing a node fan out from/to it; they do not cross there.
+				if (
+					a.rec.from.uid === b.rec.from.uid ||
+					a.rec.to.uid === b.rec.to.uid ||
+					a.rec.from.uid === b.rec.to.uid ||
+					a.rec.to.uid === b.rec.from.uid
+				)
+					continue;
+				if (a.maxX < b.minX || b.maxX < a.minX || a.maxY < b.minY || b.maxY < a.minY) continue;
+				let found: number | null = null;
+				for (let si = 0; si < HOP_SAMPLES && found === null; si++) {
+					for (let sj = 0; sj < HOP_SAMPLES && found === null; sj++) {
+						const hit = segIntersect(a.pts[si], a.pts[si + 1], b.pts[sj], b.pts[sj + 1]);
+						if (!hit) continue;
+						const ti = (si + hit.t) / HOP_SAMPLES;
+						const tj = (sj + hit.u) / HOP_SAMPLES;
+						if (ti < HOP_MIN_T || ti > 1 - HOP_MIN_T || tj < HOP_MIN_T || tj > 1 - HOP_MIN_T) continue;
+						found = tj;
+					}
+				}
+				if (found === null) continue;
+				const uid = b.rec.from.uid;
+				let arr = out.get(uid);
+				if (!arr) out.set(uid, (arr = []));
+				if (!arr.some((t) => Math.abs(t - found!) < 0.02)) arr.push(found);
+			}
+		}
+		return out;
+	}
+
+	function drawEdge(rec: LocalLink, boxes: Map<string, Box>, opts: LocalOptions, hops: number[] | null): void {
+		const path = edgePath(rec, boxes);
+		if (!path) return;
+		const { p0, p1, p2, p3 } = path;
 		const rgb = edgeRGB(rec.data.dispatch);
 		const depth = Math.max(rec.from.depth, rec.to.depth);
 		let alpha = depth >= 2 ? 0.26 : depth === 1 ? 0.5 : 0.72;
 		if (!rec.valid) alpha = 0.1;
-		const p0 = { x: a.x + a.w, y: ay };
-		const p3 = rec.internal ? { x: b.x + b.w, y: by } : { x: b.x, y: by };
-		const dx = rec.internal ? 52 * zoom : Math.max(22, Math.abs(p3.x - p0.x) * 0.42);
-		const c1 = { x: p0.x + dx, y: p0.y };
-		const c2 = { x: rec.internal ? p3.x + dx : p3.x - dx, y: p3.y };
 
 		ctx.save();
 		ctx.strokeStyle = rgba(rgb, alpha);
@@ -234,13 +397,17 @@ export function createRenderer(
 			opts.perCallArrows && rec.data.sites && rec.data.sites.length > 1 ? rec.data.sites.length : 1;
 		for (let k = 0; k < calls; k++) {
 			const off = calls > 1 ? (k - (calls - 1) / 2) * 5 : 0;
-			ctx.beginPath();
-			ctx.moveTo(p0.x, p0.y + off);
-			ctx.bezierCurveTo(c1.x, c1.y + off, c2.x, c2.y + off, p3.x, p3.y + off);
-			ctx.stroke();
+			if (hops && hops.length) {
+				strokePathWithHops(samplePath(path, HOP_DRAW_SAMPLES, off), hops);
+			} else {
+				ctx.beginPath();
+				ctx.moveTo(p0.x, p0.y + off);
+				ctx.bezierCurveTo(p1.x, p1.y + off, p2.x, p2.y + off, p3.x, p3.y + off);
+				ctx.stroke();
+			}
 		}
 		ctx.setLineDash([]);
-		arrowHead(p3.x, p3.y, p3.x - c2.x, p3.y - c2.y, 8, alpha + 0.08);
+		arrowHead(p3.x, p3.y, p3.x - p2.x, p3.y - p2.y, 8, alpha + 0.08);
 
 		if (opts.perCallArrows && rec.line !== Infinity && calls === 1) {
 			ctx.globalAlpha = alpha + 0.2;
@@ -275,7 +442,7 @@ export function createRenderer(
 		ctx.restore();
 	}
 
-	function drawNode(box: Box, col: LocalColumn, opts: LocalOptions, isHover: boolean): void {
+	function drawNode(box: Box, col: LocalColumn, opts: LocalOptions, isHover: boolean, isFocus = false): void {
 		const it = box.it;
 		const s = box.h / BASE_H;
 		const isCenter = col.key === 'C';
@@ -291,6 +458,16 @@ export function createRenderer(
 		if (it.external) ctx.setLineDash([5, 4]);
 		ctx.stroke();
 		ctx.setLineDash([]);
+
+		if (isFocus) {
+			ctx.save();
+			ctx.globalAlpha = 1;
+			ctx.lineWidth = 2;
+			ctx.strokeStyle = COLORS.focusRing;
+			roundRect(box.x - 2.5, box.y - 2.5, box.w + 5, box.h + 5, 8 * s + 2.5);
+			ctx.stroke();
+			ctx.restore();
+		}
 
 		const pad = 9 * s;
 		const nameSize = Math.max(9, Math.round(13 * s));
@@ -370,8 +547,11 @@ export function createRenderer(
 		ctx.fillStyle = COLORS.bg;
 		ctx.fillRect(0, 0, cssW, cssH);
 
-		// edges behind nodes
-		for (const rec of data.edges) drawEdge(rec, boxes, opts);
+		// edges behind nodes (semicircular hops on visible crossings)
+		const hops = opts.hops ? computeHops(data.edges, boxes) : null;
+		lastHopCount = 0;
+		if (hops) for (const arr of hops.values()) lastHopCount += arr.length;
+		for (const rec of data.edges) drawEdge(rec, boxes, opts, hops ? (hops.get(rec.from.uid) ?? null) : null);
 
 		// fading stubs for hidden grandparents / grandchildren
 		for (const g of geo) {
@@ -383,7 +563,7 @@ export function createRenderer(
 
 		// nodes
 		for (const g of geo) {
-			for (const box of g.boxes) drawNode(box, g.col, opts, box.it.uid === hoverUid);
+			for (const box of g.boxes) drawNode(box, g.col, opts, box.it.uid === hoverUid, box.it.uid === focusUid);
 		}
 
 		// column headers
@@ -451,11 +631,116 @@ export function createRenderer(
 		return cx >= px - 3 && cx <= px + pr + 3 && cy >= py - 3 && cy <= py + pr + 3;
 	}
 
+	function boxOf(uid: string): { box: Box; col: LocalColumn } | null {
+		const geo = lastGeo.length ? lastGeo : layout();
+		for (const g of geo) {
+			for (const b of g.boxes) if (b.it.uid === uid) return { box: b, col: g.col };
+		}
+		return null;
+	}
+
+	function ensureVisible(box: Box, col: LocalColumn): void {
+		if (col.key === 'C') return;
+		const s = getScroll(col.key);
+		const top = CONTENT_TOP;
+		const bottom = CONTENT_TOP + Math.max(60, cssH - CONTENT_TOP - CONTENT_BOTTOM);
+		const cy = box.y + box.h / 2;
+		if (cy - box.h / 2 < top) s.inst = clamp(s.inst - (top - (cy - box.h / 2)) - 8, 0, s.max);
+		else if (cy + box.h / 2 > bottom) s.inst = clamp(s.inst + (cy + box.h / 2 - bottom) + 8, 0, s.max);
+	}
+
+	function setFocus(uid: string | null): void {
+		focusUid = uid;
+		if (!uid) return;
+		const f = boxOf(uid);
+		if (f) ensureVisible(f.box, f.col);
+	}
+
+	function getFocused(): LocalItem | null {
+		if (!focusUid) return null;
+		const f = boxOf(focusUid);
+		return f ? f.box.it : null;
+	}
+
+	function focusInfo(): FocusInfo | null {
+		if (!focusUid) return null;
+		const f = boxOf(focusUid);
+		if (!f) return null;
+		const it = f.box.it;
+		return {
+			uid: it.uid,
+			id: it.id,
+			name: it.node.name,
+			file: it.node.file,
+			line: it.node.line,
+			column: f.col.key
+		};
+	}
+
+	// Arrow-key navigation: up/down within a column, left/right to the nearest
+	// item in the adjacent column (by vertical centre).
+	function moveFocus(dir: 'up' | 'down' | 'left' | 'right'): LocalItem | null {
+		const geo = layout();
+		if (!geo.length) return null;
+		let curBox: Box | null = null;
+		let curGeo: Geo | null = null;
+		if (focusUid) {
+			for (const g of geo) {
+				for (const b of g.boxes) {
+					if (b.it.uid === focusUid) {
+						curBox = b;
+						curGeo = g;
+						break;
+					}
+				}
+				if (curBox) break;
+			}
+		}
+		if (!curBox || !curGeo) {
+			const cg = geo.find((g) => g.col.key === 'C') ?? geo[Math.floor(geo.length / 2)];
+			const b = cg.boxes[Math.floor(cg.boxes.length / 2)] ?? cg.boxes[0];
+			if (!b) return null;
+			setFocus(b.it.uid);
+			return b.it;
+		}
+		if (dir === 'up' || dir === 'down') {
+			const list = curGeo.col.items;
+			const i = list.findIndex((it) => it.uid === focusUid);
+			const target = list[clamp(i + (dir === 'up' ? -1 : 1), 0, list.length - 1)];
+			if (!target) return curBox.it;
+			setFocus(target.uid);
+			return target;
+		}
+		const ordered = geo.slice().sort((a, b) => a.x - b.x);
+		const ci = ordered.findIndex((g) => g.col.key === curGeo.col.key);
+		const ti = clamp(ci + (dir === 'left' ? -1 : 1), 0, ordered.length - 1);
+		if (ti === ci) return curBox.it;
+		const targetGeo = ordered[ti];
+		if (!targetGeo.boxes.length) return curBox.it;
+		const cy = curBox.y + curBox.h / 2;
+		let best = targetGeo.boxes[0];
+		let bestD = Infinity;
+		for (const b of targetGeo.boxes) {
+			const d = Math.abs(b.y + b.h / 2 - cy);
+			if (d < bestD) {
+				bestD = d;
+				best = b;
+			}
+		}
+		setFocus(best.it.uid);
+		return best.it;
+	}
+
 	function setData(next: ColumnData): void {
 		data = next;
 		// drop scroll state for columns that changed identity
 		const keys = new Set(next.columns.map((c) => c.key));
 		for (const k of [...scroll.keys()]) if (!keys.has(k)) scroll.delete(k);
+		if (focusUid) {
+			let found = false;
+			for (const c of next.columns) for (const it of c.items) if (it.uid === focusUid) found = true;
+			if (!found) focusUid = null;
+		}
 	}
 
 	function resetScroll(): void {
@@ -522,7 +807,15 @@ export function createRenderer(
 		stop,
 		resize,
 		resetScroll,
+		setFocus,
+		getFocused,
+		focusInfo,
+		moveFocus,
+		clearFocus(): void {
+			focusUid = null;
+		},
 		hitTest,
+		debugHopCount: () => lastHopCount,
 		debugBoxes: () =>
 			layout().flatMap((g) =>
 				g.boxes.map((b) => ({ uid: b.it.uid, id: b.it.id, column: g.col.key, x: b.x, y: b.y, w: b.w, h: b.h }))

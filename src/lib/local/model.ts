@@ -20,6 +20,8 @@ export type LocalOptions = {
 	treeMode: boolean;
 	perCallArrows: boolean;
 	showFile: boolean;
+	/** draw a semicircular hop where two bezier edges cross (visual only) */
+	hops: boolean;
 	dispatch: DispatchMode;
 	sort: SortMode;
 };
@@ -31,6 +33,7 @@ export const DEFAULT_OPTIONS: LocalOptions = {
 	treeMode: false, // true = tree (duplicate a node per parent), false = graph (dedupe)
 	perCallArrows: false, // one arrow per call site + line numbers
 	showFile: false, // node content: name only vs name + file
+	hops: false, // draw semicircular hops at visible edge crossings (visual only)
 	dispatch: 'all', // all | yes (static+self) | maybe (virtual) | no
 	sort: 'alpha' // alpha | line | mincross
 };
