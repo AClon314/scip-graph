@@ -16,9 +16,11 @@
 		level,
 		searchCount,
 		outlineCollapsed,
+		sizeByDegree,
 		metrics,
 		onsetlayoutmode,
 		onsetlevel,
+		ontogglesizedegree,
 		onrelayout,
 		onfit,
 		ontogglehelp,
@@ -31,9 +33,11 @@
 		level: Level;
 		searchCount: string;
 		outlineCollapsed: boolean;
+		sizeByDegree: boolean;
 		metrics: GlobalMetrics | null;
 		onsetlayoutmode: (mode: LayoutMode) => void;
 		onsetlevel: (level: Level) => void;
+		ontogglesizedegree: (value: boolean) => void;
 		onrelayout: () => void;
 		onfit: () => void;
 		ontogglehelp: () => void;
@@ -64,6 +68,16 @@
 		{#each LEVELS as lv (lv)}
 			<button class:active={level === lv} onclick={() => onsetlevel(lv)}>{lv}</button>
 		{/each}
+	</div>
+	<div class="group">
+		<label class="toggle" title="node size reflects call degree — in + out">
+			<input
+				type="checkbox"
+				checked={sizeByDegree}
+				onchange={(event) => ontogglesizedegree((event.currentTarget as HTMLInputElement).checked)}
+			/>
+			size by degree
+		</label>
 	</div>
 	<div class="group">
 		<button onclick={onrelayout} title="re-run d3-force live in the worker">re-layout</button>
@@ -180,6 +194,23 @@
 
 	input:focus {
 		outline: 1px solid #ffd54a;
+	}
+
+	.toggle {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		color: #d5dde8;
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.toggle input {
+		width: auto;
+		padding: 0;
+		border: none;
+		background: none;
+		accent-color: #ffd54a;
 	}
 
 	.search-count {

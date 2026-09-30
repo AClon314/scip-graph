@@ -19,7 +19,7 @@ export function tooltipFor(node: AggNode, level: Level, x: number, y: number): T
 			title: member?.name ?? node.name ?? node.label,
 			body:
 				`${member?.file ?? node.file}:${member?.line ?? node.line}\n` +
-				`kind ${member?.kind ?? node.kind} · degree ${node.weight}` +
+				`kind ${member?.kind ?? node.kind} · degree ${node.degree}` +
 				`${member?.svelte ? ' · .svelte' : ''}`
 		};
 	}
@@ -31,7 +31,7 @@ export function tooltipFor(node: AggNode, level: Level, x: number, y: number): T
 		x,
 		y,
 		title: node.id,
-		body: `${node.weight} symbols · ${node.intraCalls} intra-group calls`,
+		body: `${node.weight} symbols · ${node.intraCalls} intra-group calls · degree ${node.degree}`,
 		muted: `${samples}${node.members.length > 4 ? '…' : ''}`
 	};
 }

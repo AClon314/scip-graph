@@ -1,0 +1,181 @@
+/*
+ * Global density view styles.
+ *
+ * Extracted from `+page.svelte` so the page stays focused on state. Presentational
+ * rules are scoped under `.stage` (the canvas pane) so they cannot leak into the
+ * outline sidebar, the Local view or the landing page when this stylesheet is
+ * loaded during client-side navigation. `.workspace` / `.splitter` are unique to
+ * this page; the `body` background matches the previous `:global(body)` rule.
+ */
+
+body {
+	background: #f6f7f9;
+}
+
+.workspace {
+	display: flex;
+	align-items: stretch;
+	gap: 8px;
+	flex: 1 1 auto;
+	height: 100%;
+	min-height: 0;
+}
+
+.workspace .stage {
+	flex: 1 1 auto;
+	min-width: 0;
+	min-height: 0;
+}
+
+.splitter {
+	flex: 0 0 6px;
+	align-self: stretch;
+	border-radius: 3px;
+	background: transparent;
+	cursor: col-resize;
+	touch-action: none;
+}
+
+.splitter:hover,
+.splitter:active {
+	background: #2a3340;
+}
+
+.stage {
+	position: relative;
+	box-sizing: border-box;
+	height: 100%;
+	min-height: 0;
+	overflow: hidden;
+	background: #0e1116;
+	border: 1px solid #2a3340;
+	border-radius: 10px;
+	color: #d5dde8;
+	font: 12px / 1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.stage canvas {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	display: block;
+	cursor: grab;
+	/* Pointer Events own pan/pinch; disable native scroll-zoom gestures. */
+	touch-action: none;
+}
+
+.stage canvas.panning {
+	cursor: grabbing;
+}
+
+.stage canvas.selecting {
+	cursor: crosshair;
+}
+
+.stage button {
+	font: inherit;
+	color: #d5dde8;
+	background: #212a36;
+	border: 1px solid #2a3340;
+	border-radius: 6px;
+	padding: 3px 9px;
+	cursor: pointer;
+}
+
+.stage button:hover {
+	border-color: #ffd54a;
+}
+
+.stage .hint {
+	position: absolute;
+	bottom: 10px;
+	left: 10px;
+	padding: 4px 8px;
+	color: #8b98a8;
+	background: #171c24cc;
+	border: 1px solid #2a3340;
+	border-radius: 6px;
+}
+
+.stage .tooltip {
+	position: absolute;
+	z-index: 5;
+	max-width: 52ch;
+	padding: 7px 9px;
+	background: #0b0f14f2;
+	border: 1px solid #2a3340;
+	border-radius: 6px;
+	pointer-events: none;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.stage .tt-title {
+	color: #ffd54a;
+}
+
+.stage .tt-muted {
+	color: #8b98a8;
+}
+
+.stage .sel-actions {
+	position: absolute;
+	right: 14px;
+	bottom: 14px;
+	z-index: 6;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.stage .sel-status {
+	padding: 5px 10px;
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	color: #cbd5e1;
+	background: #171c24cc;
+	border: 1px solid #2a3340;
+	border-radius: 6px;
+	white-space: nowrap;
+}
+
+.stage .jump {
+	padding: 8px 14px;
+	font-size: 13px;
+	font-weight: 700;
+	color: #1a1a1a;
+	background: #ffd54a;
+	border-color: #ffd54a;
+}
+
+.stage .status {
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	transform: translate(-50%, -50%);
+	padding: 10px 16px;
+	color: #d5dde8;
+	background: #171c24cc;
+	border: 1px solid #2a3340;
+	border-radius: 8px;
+}
+
+.stage .toast {
+	position: absolute;
+	left: 50%;
+	bottom: 56px;
+	transform: translateX(-50%);
+	padding: 6px 12px;
+	color: #1a1a1a;
+	background: #ffd54a;
+	border-radius: 6px;
+	font-weight: 700;
+}
+
+.stage .selbox {
+	position: absolute;
+	border: 1px dashed #ffd54a;
+	background: #ffd54a22;
+	pointer-events: none;
+}

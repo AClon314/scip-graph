@@ -9,9 +9,11 @@
  *   symbol -> each node individually
  *
  * Node weight = group member count (dir/file) or call degree (symbol).
- * Node rectangle size = base 60x24 world units, scaled by a bounded sqrt of the
- * weight relative to that level's median (keeps one giant group from becoming
- * a wall while still encoding weight monotonically).
+ * Node degree = summed member call activity (dir/file) or the raw call degree
+ * (symbol). Node rectangle size = base 60x24 world units, scaled by a bounded
+ * sqrt of the degree relative to that level's median (keeps one giant group
+ * from becoming a wall while still encoding degree monotonically). Pass
+ * `{ sizeByDegree: false }` for uniform base-sized rectangles.
  */
 
 import type { SgGraph, SgNode, SgRange } from '$lib/graph/schema';
@@ -31,6 +33,9 @@ export type AggNode = {
   label: string;
   level: Level;
   weight: number;
+  /** Call degree driving the rectangle size: (in + out) calls at symbol level,
+   * summed member call activity at dir/file level. */
+  degree: number;
   intraCalls: number;
   svelte: boolean;
   /** Half width / half height of the drawn rectangle, in world units. */
@@ -71,6 +76,25 @@ export type Aggregation = {
   rawEdgeCount: number;
 };
 
+/** Options controlling how node rectangles are sized. */
+export type AggregateOptions = {
+  /** Scale rectangle size by call degree (default true); false = uniform base size. */
+  sizeByDegree?: boolean;
+};
+
+/** Node-id sets for each level, used to resolve a persisted selection's level. */
+export function levelIdSets(graph: SgGraph): Record<Level, Set<string>> {
+  const dir = new Set<string>();
+  const file = new Set<string>();
+  const symbol = new Set<string>();
+  for (const node of graph.nodes) {
+    dir.add(groupKey(node, 'dir'));
+    file.add(groupKey(node, 'file'));
+    symbol.add(node.id);
+  }
+  return { dir, file, symbol };
+}
+
 /** Group key for a node at a level. */
 export function groupKey(node: SgNode, level: Level): string {
   if (level === 'symbol') return node.id;
@@ -102,7 +126,11 @@ function shortLabel(id: string, level: Level): string {
 }
 
 /** Aggregate the frozen graph to one of the three hierarchy levels. */
-export function aggregate(graph: SgGraph, level: Level): Aggregation {
+export function aggregate(
+  graph: SgGraph,
+  level: Level,
+  options: AggregateOptions = {}
+): Aggregation {
   const groups = new Map<
     string,
     {
@@ -110,6 +138,7 @@ export function aggregate(graph: SgGraph, level: Level): Aggregation {
       label: string;
       members: SgNode[];
       weight: number;
+      degree: number;
       intraCalls: number;
       svelte: boolean;
     }
@@ -124,6 +153,7 @@ export function aggregate(graph: SgGraph, level: Level): Aggregation {
         label: shortLabel(key, level),
         members: [],
         weight: 0,
+        degree: 0,
         intraCalls: 0,
         svelte: false,
       };
@@ -131,6 +161,7 @@ export function aggregate(graph: SgGraph, level: Level): Aggregation {
     }
     group.members.push(node);
     group.weight += 1;
+    group.degree += Math.max(1, node.weight ?? 1);
     if (node.svelte) group.svelte = true;
   }
 
@@ -139,13 +170,15 @@ export function aggregate(graph: SgGraph, level: Level): Aggregation {
     for (const group of groups.values()) {
       const node = group.members[0];
       group.weight = Math.max(1, node?.weight ?? 1);
+      group.degree = group.weight;
     }
   }
 
-  const ref = median([...groups.values()].map((g) => g.weight));
+  const sizeByDegree = options.sizeByDegree ?? true;
+  const ref = median([...groups.values()].map((g) => g.degree));
   const nodes: AggNode[] = [];
   for (const group of groups.values()) {
-    const scale = scaleFor(group.weight, ref);
+    const scale = sizeByDegree ? scaleFor(group.degree, ref) : 1;
     const hw = (BASE_W * scale) / 2;
     const hh = (BASE_H * scale) / 2;
     const node: AggNode = {
@@ -153,6 +186,7 @@ export function aggregate(graph: SgGraph, level: Level): Aggregation {
       label: group.label,
       level,
       weight: group.weight,
+      degree: group.degree,
       intraCalls: group.intraCalls,
       svelte: group.svelte,
       hw,
