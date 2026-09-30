@@ -1,6 +1,7 @@
 /**
  * Pure model logic for the local butterfly view (faithful TS port of
- * `view-b/model.js`): ±2 hop column expansion, multi-focus center set `S`
+ * `view-b/model.js`): ±N hop column expansion (N configurable, default 2),
+ * multi-focus center set `S`
  * with union/dedupe + member annotations, option-driven pruning / pass-through
  * bypass, reachability, and sorting.
  *
@@ -40,6 +41,16 @@ export const DEFAULT_OPTIONS: LocalOptions = {
 
 export const SORT_MODES: SortMode[] = ['alpha', 'line', 'mincross'];
 export const DISPATCH_MODES: DispatchMode[] = ['all', 'yes', 'maybe', 'no'];
+
+/** Default number of caller/callee levels expanded on each side. */
+export const DEFAULT_DEPTH = 2;
+
+/** Coerce arbitrary input into a positive integer depth (>= 1). */
+export function clampDepth(n: unknown): number {
+	const v = typeof n === 'number' ? n : Number(n);
+	if (!Number.isFinite(v)) return DEFAULT_DEPTH;
+	return Math.max(1, Math.floor(v));
+}
 
 /** A column item (a visible node copy; duplicated in tree mode). */
 export type LocalItem = {
@@ -323,7 +334,13 @@ export type ExpandResult = {
 };
 
 // Expand the butterfly for a center set S.
-export function expand(graph: LocalGraph, centerIds: string[], options: LocalOptions): ExpandResult {
+export function expand(
+	graph: LocalGraph,
+	centerIds: string[],
+	options: LocalOptions,
+	depth: number = DEFAULT_DEPTH
+): ExpandResult {
+	const levels = clampDepth(depth);
 	const centerSet = new Set(centerIds.filter((id) => graph.nodesById.has(id)));
 	const centerList = [...centerSet];
 	const reachable = computeReachable(graph, centerSet, options);
@@ -338,31 +355,62 @@ export function expand(graph: LocalGraph, centerIds: string[], options: LocalOpt
 		addTo(inAdj, e.to, e.from);
 	}
 
-	// 1. raw ±2 neighbourhood from the original graph (grandparents, not siblings)
-	const L1 = neighborMap(graph.edges, centerList, 'in', centerSet);
-	const seenL = new Set<string>(centerSet);
-	for (const id of L1.keys()) seenL.add(id);
-	const L2 = neighborMap(graph.edges, [...L1.keys()], 'in', seenL);
+	// 1. raw ±N neighbourhood from the original graph (grandparents, not
+	// siblings). Each level excludes every node already seen at a nearer level,
+	// so a node only appears in the closest column that reaches it (dedupe).
+	// Expansion terminates early once a level reaches no new nodes.
+	const leftMaps: Array<Map<string, Set<string>>> = [];
+	const rightMaps: Array<Map<string, Set<string>>> = [];
+	let seenL = new Set<string>(centerSet);
+	let frontierL = centerList;
+	for (let d = 1; d <= levels; d++) {
+		const m = neighborMap(graph.edges, frontierL, 'in', seenL);
+		leftMaps.push(m);
+		if (!m.size) break;
+		for (const id of m.keys()) seenL.add(id);
+		frontierL = [...m.keys()];
+	}
+	let seenR = new Set<string>(centerSet);
+	let frontierR = centerList;
+	for (let d = 1; d <= levels; d++) {
+		const m = neighborMap(graph.edges, frontierR, 'out', seenR);
+		rightMaps.push(m);
+		if (!m.size) break;
+		for (const id of m.keys()) seenR.add(id);
+		frontierR = [...m.keys()];
+	}
 
-	const R1 = neighborMap(graph.edges, centerList, 'out', centerSet);
-	const seenR = new Set<string>(centerSet);
-	for (const id of R1.keys()) seenR.add(id);
-	const R2 = neighborMap(graph.edges, [...R1.keys()], 'out', seenR);
-
-	// 2. materialise columns
-	const columns: LocalColumn[] = [
-		{ key: 'L2', side: 'left', depth: 2, label: 'grandparents', items: makeItems(L2, 'L2', 'left', 2, graph, options) },
-		{ key: 'L1', side: 'left', depth: 1, label: 'callers', items: makeItems(L1, 'L1', 'left', 1, graph, options) },
-		{
-			key: 'C',
-			side: 'center',
-			depth: 0,
-			label: 'focus',
-			items: makeItems(new Map(centerList.map((id) => [id, new Set<string>()])), 'C', 'center', 0, graph, options)
-		},
-		{ key: 'R1', side: 'right', depth: 1, label: 'callees', items: makeItems(R1, 'R1', 'right', 1, graph, options) },
-		{ key: 'R2', side: 'right', depth: 2, label: 'grandchildren', items: makeItems(R2, 'R2', 'right', 2, graph, options) }
-	];
+	// 2. materialise columns: deepest left first … centre … deepest right last
+	const labelFor = (side: Side, d: number): string =>
+		side === 'left' ? (d === 1 ? 'callers' : `ancestors ${d}`) : d === 1 ? 'callees' : `descendants ${d}`;
+	const columns: LocalColumn[] = [];
+	for (let d = leftMaps.length; d >= 1; d--) {
+		columns.push({
+			key: `L${d}`,
+			side: 'left',
+			depth: d,
+			label: labelFor('left', d),
+			items: makeItems(leftMaps[d - 1], `L${d}`, 'left', d, graph, options)
+		});
+	}
+	columns.push({
+		key: 'C',
+		side: 'center',
+		depth: 0,
+		label: 'focus',
+		items: makeItems(new Map(centerList.map((id) => [id, new Set<string>()])), 'C', 'center', 0, graph, options)
+	});
+	for (let d = 1; d <= rightMaps.length; d++) {
+		columns.push({
+			key: `R${d}`,
+			side: 'right',
+			depth: d,
+			label: labelFor('right', d),
+			items: makeItems(rightMaps[d - 1], `R${d}`, 'right', d, graph, options)
+		});
+	}
+	const leftOuter = leftMaps.length;
+	const rightOuter = rightMaps.length;
 
 	// 3. item-level edges between adjacent columns + intra-center links
 	const pairMap = buildPairMap(graph.edges);
@@ -471,7 +519,10 @@ export function expand(graph: LocalGraph, centerIds: string[], options: LocalOpt
 			} else {
 				it.members = membersOf(it);
 			}
-			if (it.depth === 2) {
+			const isOuter =
+				(it.side === 'left' && it.depth === leftOuter) ||
+				(it.side === 'right' && it.depth === rightOuter);
+			if (isOuter) {
 				const neighbours = it.side === 'left' ? inAdj.get(it.id) : outAdj.get(it.id);
 				it.hasMore = !!neighbours && [...neighbours].some((other) => !displayedIds.has(other));
 			} else {
@@ -503,23 +554,28 @@ function byLine(a: LocalItem, b: LocalItem): number {
 // neighbours in the already-ordered inner column; sweep a few times.
 function minCrossing(columns: LocalColumn[]): void {
 	const col: Record<string, LocalColumn> = Object.fromEntries(columns.map((c) => [c.key, c]));
-	col.C.items.sort(byName);
-	const sequence: Array<[string, string]> = [
-		['L1', 'C'],
-		['L2', 'L1'],
-		['R1', 'C'],
-		['R2', 'R1']
-	];
+	if (col.C) col.C.items.sort(byName);
+	const sequence: Array<[string, string]> = [];
+	let maxLeft = 0;
+	let maxRight = 0;
+	for (const c of columns) {
+		if (c.side === 'left' && c.depth > maxLeft) maxLeft = c.depth;
+		if (c.side === 'right' && c.depth > maxRight) maxRight = c.depth;
+	}
+	for (let d = 1; d <= maxLeft; d++) sequence.push([`L${d}`, d === 1 ? 'C' : `L${d - 1}`]);
+	for (let d = 1; d <= maxRight; d++) sequence.push([`R${d}`, d === 1 ? 'C' : `R${d - 1}`]);
 	for (let iter = 0; iter < 4; iter++) {
 		for (const [outerKey, innerKey] of sequence) {
 			const inner = col[innerKey];
+			const outer = col[outerKey];
+			if (!inner || !outer) continue;
 			const idx = new Map(inner.items.map((it, i) => [it.uid, i]));
-			const scored = col[outerKey].items.map((it) => {
+			const scored = outer.items.map((it) => {
 				const ns = it.innerRefs.map((r) => idx.get(r.uid)).filter((v): v is number => v !== undefined);
 				return { it, m: median(ns) };
 			});
 			scored.sort((a, b) => a.m - b.m || byName(a.it, b.it));
-			col[outerKey].items = scored.map((s) => s.it);
+			outer.items = scored.map((s) => s.it);
 		}
 	}
 }
@@ -538,26 +594,33 @@ export function sortColumns(columns: LocalColumn[], options: LocalOptions): Loca
 export type ColumnsState = {
 	left: string[];
 	right: string[];
+	/** per-level ids, index 0 = L1/R1 (nearest the centre) */
+	leftLevels: string[][];
+	rightLevels: string[][];
 	left1: string[];
 	left2: string[];
 	right1: string[];
 	right2: string[];
 };
 
-// Convenience projection for window.__local.state()
+// Convenience projection for window.__local.state(). Levels are ascending from
+// the centre (L1 nearest). `left1`/`left2` etc. are kept for compatibility.
 export function columnsState(columns: LocalColumn[]): ColumnsState {
-	const pick = (key: string): string[] => {
-		const c = columns.find((x) => x.key === key);
-		return c ? [...new Set(c.items.map((i) => i.id))] : [];
-	};
-	const left = [...pick('L1'), ...pick('L2')];
-	const right = [...pick('R1'), ...pick('R2')];
+	const levels = (side: Side): string[][] =>
+		columns
+			.filter((c) => c.side === side && c.depth > 0)
+			.sort((a, b) => a.depth - b.depth)
+			.map((c) => [...new Set(c.items.map((i) => i.id))]);
+	const leftLevels = levels('left');
+	const rightLevels = levels('right');
 	return {
-		left: [...new Set(left)],
-		right: [...new Set(right)],
-		left1: pick('L1'),
-		left2: pick('L2'),
-		right1: pick('R1'),
-		right2: pick('R2')
+		left: [...new Set(leftLevels.flat())],
+		right: [...new Set(rightLevels.flat())],
+		leftLevels,
+		rightLevels,
+		left1: leftLevels[0] ?? [],
+		left2: leftLevels[1] ?? [],
+		right1: rightLevels[0] ?? [],
+		right2: rightLevels[1] ?? []
 	};
 }
