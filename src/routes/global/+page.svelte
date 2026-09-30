@@ -17,15 +17,16 @@
 		type Aggregation,
 		type Level
 	} from '$lib/global/aggregate';
-	import { rectOf } from '$lib/global/metrics';
+	import { computeMetrics, rectOf } from '$lib/global/metrics';
 	import type {
 		LayoutParams,
 		LayoutRequest,
 		LayoutResponse
 	} from '$lib/global/layout.worker';
+	import type { ElkStressLayout, ElkStressPosition } from '$lib/global/elk-stress';
 	import { jumpToSource } from '$lib/global/jump';
 
-	let { data }: { data: { graph: SgGraph | null } } = $props();
+	let { data }: { data: { graph: SgGraph | null; elkStress: ElkStressLayout | null } } = $props();
 
 	const TICKS: Record<Level, number> = { dir: 320, file: 450, symbol: 400 };
 	const PARAMS: Record<Level, LayoutParams> = {
@@ -34,6 +35,9 @@
 		symbol: { linkDistance: 80, linkStrength: 0.15, charge: -40, chargeDistanceMax: 600 }
 	};
 	const HANDOFF_KEY = 'gpen.scip.selection';
+
+	/** Live d3-force worker (default) or the precomputed offline ELK stress layout. */
+	type LayoutMode = 'd3-force' | 'elk-stress';
 
 	type GlobalMetrics = {
 		level: Level;
@@ -47,6 +51,8 @@
 		cleanupPasses: number;
 		overlapsBeforeCleanup: number;
 		overlapsAfterCleanup: number;
+		/** elk-stress only: wall time of the offline precompute. */
+		precomputeMs?: number;
 	};
 
 	type Tooltip = { x: number; y: number; title: string; body: string; muted?: string };
@@ -82,6 +88,8 @@
 	let allSymbolIds = new Set<string>();
 	let symbolsByFile = new Map<string, string[]>();
 	let symbolsByDir = new Map<string, string[]>();
+	/** Precomputed elk-stress positions keyed by symbol id (null when absent). */
+	let elkPositions: Map<string, ElkStressPosition> | null = null;
 
 	let canvasEl: HTMLCanvasElement | undefined = $state();
 	let ctx: CanvasRenderingContext2D | null = null;
@@ -94,7 +102,10 @@
 
 	// --- reactive UI state ---------------------------------------------------
 	let level = $state<Level>('dir');
+	let layoutMode = $state<LayoutMode>('d3-force');
 	let metrics = $state<GlobalMetrics | null>(null);
+	const elkAvailable = $derived(data.elkStress !== null);
+	const elkPrecomputeMs = $derived(data.elkStress?.ms ?? 0);
 	let status = $state<string | null>(null);
 	let toast = $state<string | null>(null);
 	let selectionCount = $state(0);
@@ -168,8 +179,18 @@
 	async function setLevel(next: Level, { keepSelection = false } = {}): Promise<GlobalMetrics | undefined> {
 		if (!LEVELS.includes(next)) throw new Error(`unknown level ${next}`);
 		if (!keepSelection) selection.clear();
+		// elk-stress is symbol-only; any other level falls back to live d3-force.
+		if (layoutMode === 'elk-stress' && next !== 'symbol') layoutMode = 'd3-force';
 		level = next;
 		updateSelectionUi();
+		return relayout();
+	}
+
+	/** Switch between the live worker layout and the precomputed offline layout. */
+	async function setLayoutMode(mode: LayoutMode): Promise<GlobalMetrics | undefined> {
+		if (mode === 'elk-stress' && !elkAvailable) return metrics ?? undefined;
+		layoutMode = mode;
+		if (mode === 'elk-stress' && level !== 'symbol') return setLevel('symbol');
 		return relayout();
 	}
 
@@ -183,6 +204,19 @@
 		const token = ++layoutToken;
 		agg = aggregate(graph, level);
 		nodeById = new Map(agg.nodes.map((n) => [n.id, n]));
+		if (layoutMode === 'elk-stress' && level === 'symbol' && elkCovers()) {
+			// Precomputed positions: no worker round-trip, no 6 s wait.
+			applyElkPositions();
+			if (token !== layoutToken) return metrics ?? undefined;
+			setStatus(null);
+			fit();
+			draw();
+			return metrics ?? undefined;
+		}
+		if (layoutMode === 'elk-stress' && level === 'symbol') {
+			layoutMode = 'd3-force';
+			showToast('precomputed elk-stress layout is stale — run bun run precompute:elk');
+		}
 		setStatus(`computing ${level} layout in worker…`);
 		await layoutForce(token);
 		if (token !== layoutToken) return metrics ?? undefined;
@@ -190,6 +224,48 @@
 		fit();
 		draw();
 		return metrics ?? undefined;
+	}
+
+	/** True when every symbol node has a matching precomputed position. */
+	function elkCovers(): boolean {
+		if (!elkPositions || !agg) return false;
+		if (elkPositions.size !== agg.nodes.length) return false;
+		for (const node of agg.nodes) if (!elkPositions.has(node.id)) return false;
+		return true;
+	}
+
+	/**
+	 * Place the current symbol aggregate from the precomputed file and re-derive
+	 * the overlap/fill metrics on the main thread (independent of the worker's
+	 * numbers) so `nodeOverlapRatio === 0` is verified, not assumed.
+	 */
+	function applyElkPositions(): void {
+		if (!agg || !elkPositions) return;
+		const t0 = performance.now();
+		for (const node of agg.nodes) {
+			const p = elkPositions.get(node.id);
+			if (p) {
+				node.x = p.x;
+				node.y = p.y;
+			}
+		}
+		const derived = computeMetrics(
+			agg.nodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, hw: n.hw, hh: n.hh }))
+		);
+		metrics = {
+			level: 'symbol',
+			source: 'elk-stress',
+			nodes: agg.nodes.length,
+			edges: agg.edges.length,
+			ms: Math.round((performance.now() - t0) * 100) / 100,
+			nodeOverlapRatio: derived.nodeOverlapRatio,
+			nodeOverlapPairs: derived.nodeOverlapPairs,
+			fillNet: Math.round(derived.fillNet * 1e4) / 1e4,
+			cleanupPasses: data.elkStress?.cleanupPasses ?? 0,
+			overlapsBeforeCleanup: 0,
+			overlapsAfterCleanup: derived.nodeOverlapPairs,
+			precomputeMs: data.elkStress?.ms
+		};
 	}
 
 	function applyPositions(positions: LayoutResponse['positions']) {
@@ -983,6 +1059,9 @@
 	onMount(() => {
 		graph = data.graph;
 		if (graph) buildSymbolMaps(graph);
+		if (data.elkStress) {
+			elkPositions = new Map(data.elkStress.positions.map((p) => [p.id, p]));
+		}
 		if (!canvasEl) return;
 		ctx = canvasEl.getContext('2d');
 
@@ -1009,10 +1088,13 @@
 
 		const handle = {
 			setLevel,
+			setLayoutMode,
 			select,
 			selection: selectionIds,
 			metrics: () => metrics,
 			relayout,
+			layout: () => layoutMode,
+			elkAvailable: () => elkAvailable,
 			fit: () => {
 				fit();
 				draw();
@@ -1095,6 +1177,22 @@
 
 	<div class="toolbar">
 		<div class="group">
+			<span class="title">layout</span>
+			<button
+				class:active={layoutMode === 'd3-force'}
+				onclick={() => setLayoutMode('d3-force')}
+				title="live d3-force in a Web Worker (symbol ≈ 6 s)">d3-force</button
+			>
+			<button
+				class:active={layoutMode === 'elk-stress'}
+				disabled={!elkAvailable}
+				onclick={() => setLayoutMode('elk-stress')}
+				title={elkAvailable
+					? `precomputed ELK stress (symbol only, offline ${elkPrecomputeMs} ms) — instant load`
+					: 'precomputed layout missing — run bun run precompute:elk'}>elk-stress</button
+			>
+		</div>
+		<div class="group">
 			<span class="title">level</span>
 			{#each LEVELS as lv (lv)}
 				<button class:active={level === lv} onclick={() => setLevel(lv)}>{lv}</button>
@@ -1125,6 +1223,9 @@
 				<b>{metrics.level}</b> · <b>{metrics.source}</b> · nodes <b>{metrics.nodes}</b> · edges
 				<b>{metrics.edges}</b> · ms <b>{metrics.ms}</b> · overlap
 				<b>{metrics.nodeOverlapRatio}</b> · fill <b>{metrics.fillNet}</b>
+				{#if metrics.precomputeMs !== undefined}
+					· precomputed <b>{metrics.precomputeMs}ms</b>
+				{/if}
 			</div>
 		{/if}
 	</div>
@@ -1284,6 +1385,15 @@
 
 	button:hover {
 		border-color: #ffd54a;
+	}
+
+	button:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
+
+	button:disabled:hover {
+		border-color: #2a3340;
 	}
 
 	button.active {

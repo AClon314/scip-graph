@@ -14,6 +14,7 @@
 | ----------------------------------- | -------------------------------------------------------------------- |
 | [`query-cli.md`](query-cli.md)      | `bun src/bin/scip-graph.ts` 的 `callers`/`callees`/`impact`/`refs`/`boundaries` 用法、选择器、`--json` 契约、mermaid/dot 导出 |
 | [`query-verification.md`](query-verification.md) | 对真实 `static/graph.json` 跑出的验证记录（精确计数） |
+| [`phase6-acceleration.md`](phase6-acceleration.md) | Phase 6 加速：离线预计算 ELK `stress` 布局（`bun run precompute:elk`）、global 视图 layout 切换、为什么不做 WASM/多线程 |
 | [`fork-build.md`](fork-build.md)    | scip-typescript fork 的 Svelte + callee 补丁、构建、索引，以及派生查看器图 |
 
 ## 历史 PoC（原 gpen-js `rules/scip/`）

@@ -1,5 +1,8 @@
-import { loadGraph } from '$lib/server/loadGraph';
+import { loadElkStress, loadGraph } from '$lib/server/loadGraph';
 
 export async function load() {
-	return { graph: await loadGraph() };
+	return {
+		graph: await loadGraph(),
+		elkStress: await loadElkStress()
+	};
 }
