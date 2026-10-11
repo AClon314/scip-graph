@@ -30,6 +30,8 @@ export interface OrchgraphLayoutOptions {
   direction?: GraphDirection;
   /** orchgraph re-exports ELK spacing knob (2..20). */
   spacing?: number;
+  /** 是否保留分组节点（被其它节点 parentId 引用者）。orchgraph 无层级，默认丢弃，否则孤立分组会被 ELK 推开、撑大画布。 */
+  includeGroups?: boolean;
 }
 
 /** IR → orchgraph GraphDocument（扁平；分组层级 orchgraph 不支持，暂忽略）。 */
@@ -37,20 +39,34 @@ export function toOrchgraphDocument<N extends object, E extends object, G>(
   graph: VisualGraph<N, E, G>,
   opts: OrchgraphLayoutOptions = {},
 ): GraphDocument {
+  const detailOf = (data: unknown): string | undefined => {
+    const d = data as { file?: string; line?: number } | undefined;
+    return d?.file ? `${d.file}:${d.line ?? 0}` : undefined;
+  };
+  // 被引用为 parentId 的是分组节点；orchgraph 不支持层级，默认丢掉（子节点已带 file:line）。
+  const groupIds = new Set(graph.nodes.map((n) => n.parentId).filter((id): id is string => typeof id === 'string'));
+  const kept = opts.includeGroups ? graph.nodes : graph.nodes.filter((n) => !groupIds.has(n.id));
+  const keptIds = new Set(kept.map((n) => n.id));
   return {
     id: graph.id,
     direction: DIR_TO_ORCH[opts.direction ?? graph.direction ?? 'down'],
-    nodes: graph.nodes.map((n) => ({
-      id: n.id,
-      label: n.label ?? n.id,
-      ...(n.kind ? { kind: n.kind } : {}),
-    })),
-    edges: graph.edges.map((e) => ({
-      id: e.id,
-      source: e.sourceId,
-      target: e.targetId,
-      ...(e.label != null ? { label: e.label } : {}),
-    })),
+    nodes: kept.map((n) => {
+      const detail = detailOf(n.data);
+      return {
+        id: n.id,
+        label: n.label ?? n.id,
+        ...(n.kind ? { kind: n.kind } : {}),
+        ...(detail ? { detail } : {}),
+      };
+    }),
+    edges: graph.edges
+      .filter((e) => keptIds.has(e.sourceId) && keptIds.has(e.targetId))
+      .map((e) => ({
+        id: e.id,
+        source: e.sourceId,
+        target: e.targetId,
+        ...(e.label != null ? { label: e.label } : {}),
+      })),
   };
 }
 

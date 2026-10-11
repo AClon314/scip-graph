@@ -1,14 +1,61 @@
-/* 共享设计 token：与 TUI 的 KIND_COLOR / 配色对齐。
-   布局长度按 gpen 约定：横向用 ch，纵向用 lh。 */
+/*
+ * 共享设计 token（参考 gpen `src/lib/themes/day-night.css` 的机制）。
+ *
+ * 三态：`system` / `light` / `dark`。随主题变化的 token 用 `light-dark(浅, 深)` 声明一次，
+ * 由 `color-scheme` 决定取哪支；`light`/`dark` 由 JS 在 <html> 写 `data-gpen-theme` 钉死。
+ * **没有 `@media (prefers-color-scheme: dark)`** —— 它无法被属性覆盖，会顶掉手动 light。
+ * 不支持 `light-dark()` 的浏览器丢掉那一行、回落到上面那行普通值（降级不破版）。
+ *
+ * 长度约定（gpen AGENTS）：横向尺寸/间距用 `ch`，纵向（尤其 height/行高）用 `lh`；
+ * 字号 / 边框宽度 / 圆角保留 px。
+ */
+
 :root {
-  --bg: #1a1b26;
-  --panel: #16161e;
-  --border: #737aa2;
-  --fg: #c0caf5;
-  --dim: #565f89;
-  --accent: #f7768e;
-  --cw: 1ch;
-  --lh: 1lh;
+  color-scheme: light dark;
+
+  /* 等宽字体：显式指定 box-drawing 度量一致的字体，避免回退到比例字体导致 `│` 错位。 */
+  --font-mono: 'DejaVu Sans Mono', 'Noto Sans Mono', ui-monospace, Menlo, monospace;
+  --font-size: 13px;
+  --line-height: 1.164; /* DejaVu 的自然行高：`│` 才能跨行相连 */
+
+  /* palette：先普通值（降级），再 light-dark（三态）。 */
+  --bg: #f7f8fa;
+  --bg: light-dark(#f7f8fa, #1a1b26);
+  --panel: #ffffff;
+  --panel: light-dark(#ffffff, #16161e);
+  --raised: #eef1f6;
+  --raised: light-dark(#eef1f6, #1f2335);
+  --border: #c3c9d6;
+  --border: light-dark(#c3c9d6, #3b4261);
+  --fg: #1f2430;
+  --fg: light-dark(#1f2430, #c0caf5);
+  --dim: #6b7280;
+  --dim: light-dark(#6b7280, #565f89);
+  --accent: #d6336c;
+  --accent: light-dark(#d6336c, #f7768e);
+
+  /* 语义色（与 TUI 的 KIND_COLOR 语义对齐） */
+  --dir: #0b7285;
+  --dir: light-dark(#0b7285, #7dcfff);
+  --file: #343a40;
+  --file: light-dark(#343a40, #c0caf5);
+  --class: #364fc7;
+  --class: light-dark(#364fc7, #7aa2f7);
+  --fn: #2b8a3e;
+  --fn: light-dark(#2b8a3e, #9ece6a);
+  --method: #e8590c;
+  --method: light-dark(#e8590c, #e0af68);
+  --virtual: #7048e8;
+  --virtual: light-dark(#7048e8, #bb9af7);
+  --edge: #868e96;
+  --edge: light-dark(#868e96, #737aa2);
+}
+
+/* 手动主题：JS 在 <html> 写属性即可钉死 color-scheme。 */
+:root[data-gpen-theme='light'] {
+  color-scheme: light;
+}
+:root[data-gpen-theme='dark'] {
   color-scheme: dark;
 }
 
@@ -25,24 +72,44 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font-family: ui-monospace, 'JetBrains Mono', Menlo, monospace;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size);
+  line-height: var(--line-height);
 }
 
 .app {
   height: 100vh;
   display: grid;
-  grid-template-rows: var(--lh) 1fr var(--lh) var(--lh);
+  /* 头 1lh / 主体 1fr / 状态 1lh / 输入 1lh */
+  grid-template-rows: 1lh 1fr 1lh 1lh;
 }
 
 .header {
   padding-left: 1ch;
   color: var(--accent);
-  line-height: var(--lh);
+  line-height: 1lh;
   white-space: nowrap;
   overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: 1ch;
 }
 .header .sub {
+  color: var(--fg);
+}
+.header .spacer {
+  flex: 1 1 auto;
+}
+.theme-toggle {
+  margin-right: 1ch;
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  padding: 0 1ch;
+  font: inherit;
+  cursor: pointer;
+}
+.theme-toggle:hover {
   color: var(--fg);
 }
 
@@ -63,7 +130,7 @@ body {
 
 .panel-title {
   position: absolute;
-  top: calc(-0.5 * var(--lh));
+  top: calc(-0.5 * 1lh);
   left: 2ch;
   background: var(--panel);
   padding: 0 1ch;
@@ -80,19 +147,28 @@ body {
 .row {
   display: flex;
   gap: 0.5ch;
-  line-height: var(--lh);
+  line-height: 1lh;
   white-space: pre;
   cursor: pointer;
-  padding-left: calc(var(--cw) * var(--depth, 0) * 2);
+  padding-left: calc(1ch * var(--depth, 0) * 2);
 }
 .row:hover {
-  background: #1f2335;
+  background: var(--raised);
 }
 .row.dim {
   opacity: 0.4;
 }
 .row .marker {
   color: var(--dim);
+}
+.row .label.dir {
+  color: var(--dir);
+}
+.row .label.file {
+  color: var(--file);
+}
+.row .label.symbol {
+  color: var(--fn);
 }
 .row .badge {
   margin-left: auto;
@@ -122,17 +198,17 @@ body {
   display: flex;
   align-items: center;
   gap: 1ch;
-  line-height: var(--lh);
+  line-height: 1lh;
 }
 .legend .swatch {
   width: 1ch;
-  height: 1ch;
+  height: 1lh;
   display: inline-block;
 }
 
 .status {
   padding-left: 1ch;
-  line-height: var(--lh);
+  line-height: 1lh;
   border-top: 1px solid var(--border);
   display: flex;
   overflow: hidden;
@@ -146,7 +222,7 @@ body {
 
 .inputbar {
   border-top: 1px solid var(--border);
-  line-height: var(--lh);
+  line-height: 1lh;
   padding-left: 1ch;
   display: flex;
   gap: 1ch;

@@ -18,6 +18,16 @@
 
   const vm = $derived(buildAppVM({ graph, fold, selectedId, inputValue, focus }));
 
+  // 主题三态：system / light / dark（gpen 机制：JS 在 <html> 写 data-gpen-theme）。
+  let theme = $state<'system' | 'light' | 'dark'>('system');
+  $effect(() => {
+    const el = document.documentElement;
+    if (theme === 'system') delete el.dataset.gpenTheme;
+    else el.dataset.gpenTheme = theme;
+  });
+  const cycleTheme = () =>
+    (theme = theme === 'system' ? 'light' : theme === 'light' ? 'dark' : 'system');
+
   function toggle(id: string) {
     const next = new Set(fold);
     if (next.has(id)) next.delete(id);
@@ -28,7 +38,10 @@
 
 <div class="app">
   <div class="header">
-    scip-graph <span class="sub">ir → vm (sveltekit)</span>
+    <span>scip-graph</span>
+    <span class="sub">ir → vm (sveltekit)</span>
+    <span class="spacer"></span>
+    <button class="theme-toggle" onclick={cycleTheme}>theme: {theme}</button>
   </div>
 
   <div class="body">

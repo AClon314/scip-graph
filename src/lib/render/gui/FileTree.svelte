@@ -19,7 +19,7 @@
   };
 </script>
 
-<div class="panel tree" style="width: calc(var(--cw) * {widthCells})">
+<div class="panel tree" style="width: calc(1ch * {widthCells})">
   <div class="panel-title">files</div>
   {#each rows as row (row.id)}
     <div
@@ -37,7 +37,7 @@
       }}
     >
       <span class="marker">{row.hasChildren ? (row.expanded ? 'v' : '›') : '─'}</span>
-      <span class="label">{row.label}</span>
+      <span class="label {row.kind}">{row.label}</span>
       {#if row.badge}<span class="badge">{row.badge}</span>{/if}
     </div>
   {/each}

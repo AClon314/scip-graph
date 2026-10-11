@@ -31,11 +31,10 @@ import {
 import { createTestRenderer, KeyCodes } from '@opentui/core/testing';
 import { initUi, reduceKey, selectNode, type UiState } from '../lib/core/app';
 import type { Key as AppKey } from '../lib/core/keys';
-import { KIND_COLOR, buildAppVM, layoutScreen, type AppState, type CallGraph, type GraphScene } from '../lib/core/model';
+import { KIND_COLOR, buildAppVM, layoutScreen, type AppState, type CallGraph } from '../lib/core/model';
 import { fromIR } from '../lib/core/from-ir';
 import { mockLayeredGraph } from '../lib/ir/mock';
-import { CellBuffer } from '../lib/render/tui/cell';
-import { paintScene } from '../lib/render/tui/render';
+import { buildOrchgraphView, type OrchCanvasView } from '../lib/render/tui/orchgraph-canvas';
 
 const args = process.argv.slice(2);
 const flag = (n: string) => {
@@ -62,14 +61,16 @@ function makeState(): AppState {
 
 // ---------------------------------------------------------------- 自定义 renderable
 
-/** call graph 的 retained-mode 包装：内部是立即模式的 CellBuffer 绘制。 */
+/** call graph 的 retained-mode 包装：内部 blit orchgraph 产出的带色 cell 网格。 */
 class GraphRenderable extends Renderable {
-  #sceneFn: () => GraphScene;
+  view: OrchCanvasView | null = null;
+  #selected: () => string | null;
   #onPick: (id: string) => void;
+  #offset = { x: 0, y: 0 };
 
-  constructor(ctx: CliRenderer, sceneFn: () => GraphScene, onPick: (id: string) => void) {
+  constructor(ctx: CliRenderer, selected: () => string | null, onPick: (id: string) => void) {
     super(ctx, { flexGrow: 1, buffered: true });
-    this.#sceneFn = sceneFn;
+    this.#selected = selected;
     this.#onPick = onPick;
   }
 
@@ -77,19 +78,83 @@ class GraphRenderable extends Renderable {
     this.#onPick(id);
   }
 
+  /** 屏幕坐标 → canvas 坐标 → 命中节点（盒子包含优先，否则最近中心）。 */
+  hitTest(e: TuiMouseEvent): string | undefined {
+    const v = this.view;
+    if (!v) return undefined;
+    const lx = e.x - this.x + this.#offset.x;
+    const ly = e.y - this.y + this.#offset.y;
+    let near: { id: string; d: number } | undefined;
+    for (const n of v.nodes) {
+      if (lx >= n.x && lx < n.x + n.width && ly >= n.y && ly < n.y + n.height) return n.id;
+      const d = Math.hypot(n.x + n.width / 2 - lx, n.y + n.height / 2 - ly);
+      if (!near || d < near.d) near = { id: n.id, d };
+    }
+    return near?.id;
+  }
+
+  /** 显式平移（供键盘/拖拽用）。 */
+  pan(dx: number, dy: number): void {
+    const v = this.view;
+    if (!v) return;
+    const w = Math.floor(this.width);
+    const h = Math.floor(this.height);
+    const maxX = Math.max(0, v.width - w);
+    const maxY = Math.max(0, v.height - h);
+    this.#offset = {
+      x: Math.max(0, Math.min(maxX, this.#offset.x + dx)),
+      y: Math.max(0, Math.min(maxY, this.#offset.y + dy)),
+    };
+    this.requestRender();
+  }
+
   protected override renderSelf(buffer: OptimizedBuffer): void {
+    const v = this.view;
     const w = Math.max(0, Math.floor(this.width));
     const h = Math.max(0, Math.floor(this.height));
-    if (w < 6 || h < 4) return;
-    const tmp = new CellBuffer(w, h);
-    paintScene(tmp, this.#sceneFn(), { col: 0, row: 0, width: w, height: h });
+    if (!v || w < 4 || h < 4) return;
+    const sel = this.#selected();
+    const selBox = sel ? v.nodes.find((n) => n.id === sel) : undefined;
+    // 视口跟随选中节点居中，并夹在 canvas 边界内。
+    const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+    const cx = selBox ? selBox.x + selBox.width / 2 : v.width / 2;
+    const cy = selBox ? selBox.y + selBox.height / 2 : v.height / 2;
+    const offX = clamp(Math.round(cx - w / 2), 0, Math.max(0, v.width - w));
+    const offY = clamp(Math.round(cy - h / 2), 0, Math.max(0, v.height - h));
+    this.#offset = { x: offX, y: offY };
+
     const bg = RGBA.fromHex('#16161e');
-    const fgDefault = RGBA.fromHex('#c0caf5');
+    const def = RGBA.fromHex('#c0caf5');
+    const accent = RGBA.fromHex('#f7768e');
     for (let r = 0; r < h; r++) {
+      const row = v.cells[offY + r];
+      if (!row) break;
       for (let c = 0; c < w; c++) {
-        const cell = tmp.cell(r, c);
-        if (cell.ch === ' ') continue;
-        buffer.setCell(c, r, cell.ch, cell.fg ? RGBA.fromHex(cell.fg) : fgDefault, bg, 0);
+        const cell = row[offX + c];
+        if (!cell || cell.ch === ' ') continue;
+        const canvasR = offY + r;
+        const canvasC = offX + c;
+        const inSel =
+          selBox !== undefined &&
+          canvasC >= selBox.x &&
+          canvasC < selBox.x + selBox.width &&
+          canvasR >= selBox.y &&
+          canvasR < selBox.y + selBox.height;
+        const fg = inSel ? accent : cell.fg ? RGBA.fromHex(cell.fg) : def;
+        buffer.setCell(c, r, cell.ch, fg, bg, 0);
+      }
+    }
+    if (selBox) {
+      const mx = selBox.x - offX;
+      const my = selBox.y - 1 - offY;
+      if (my >= 0 && mx >= 0 && mx < w) buffer.setCell(mx, my, '▼', accent, bg, 0);
+    }
+    // 视口提示（右下角）：canvas 总尺寸 + 当前位置。
+    if (v.height > h || v.width > w) {
+      const label = `[${offX},${offY}] ${v.width}×${v.height}`;
+      const start = Math.max(0, w - label.length);
+      for (let i = 0; i < label.length && start + i < w; i++) {
+        buffer.setCell(start + i, h - 1, label[i]!, RGBA.fromHex('#565f89'), bg, 0);
       }
     }
   }
@@ -162,7 +227,7 @@ function toAppKey(e: KeyEvent): AppKey | undefined {
 
 // ---------------------------------------------------------------- app
 
-function buildApp(renderer: CliRenderer) {
+function buildApp(renderer: CliRenderer, view: OrchCanvasView | null) {
   let ui = initUi(makeState());
   const layout = layoutScreen(W, H);
 
@@ -216,28 +281,17 @@ function buildApp(renderer: CliRenderer) {
   });
   const graph = new GraphRenderable(
     renderer,
-    () => buildAppVM(ui.app).scene,
+    () => ui.app.selectedId,
     (id) => {
       ui = selectNode(ui, id);
       refresh();
     },
   );
-  // 鼠标：点图上节点（把点击位置反投影回 scene 坐标，取最近节点）。
+  graph.view = view;
+  // 鼠标：点图上节点（在 orchgraph canvas 坐标里命中盒子 / 最近中心）。
   graph.onMouseDown = (e: TuiMouseEvent) => {
-    const scene = buildAppVM(ui.app).scene;
-    const lx = e.x - graph.x;
-    const ly = e.y - graph.y;
-    const pad = 3;
-    const sx = (graph.width - pad * 2) / Math.max(1, scene.bounds.width);
-    const sy = (graph.height - pad * 2) / Math.max(1, scene.bounds.height);
-    let best: { id: string; d: number } | null = null;
-    for (const n of scene.nodes) {
-      const cx = pad + (n.x + n.width / 2 - scene.bounds.x) * sx;
-      const cy = pad + (n.y + n.height / 2 - scene.bounds.y) * sy;
-      const d = Math.hypot(cx - lx, cy - ly);
-      if (!best || d < best.d) best = { id: n.id, d };
-    }
-    if (best) graph.pick(best.id);
+    const id = graph.hitTest(e);
+    if (id) graph.pick(id);
   };
   graphBox.add(graph);
   body.add(graphBox);
@@ -301,9 +355,11 @@ const KEYCODE: Record<string, string> = {
 
 const headless = has('headless') || !process.stdin.isTTY;
 
+const orchView = await buildOrchgraphView(mockLayeredGraph, { direction: 'right', spacing: 2, maxNodeWidth: 20 });
+
 if (headless) {
   const setup = await createTestRenderer({ width: W, height: H, exitOnCtrlC: false });
-  buildApp(setup.renderer);
+  buildApp(setup.renderer, orchView);
   const spec = flag('keys');
   if (spec) {
     for (const tok of spec.split(/\s+/).filter(Boolean)) {
@@ -323,5 +379,5 @@ if (headless) {
   await setup.dispose();
 } else {
   const renderer = await createCliRenderer({ exitOnCtrlC: false, useMouse: true });
-  buildApp(renderer);
+  buildApp(renderer, orchView);
 }
