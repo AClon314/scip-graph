@@ -1,0 +1,11 @@
+{
+  "name": "scip-graph",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "derive": "bun scripts/derive.ts",
+    "tui": "bun src/tui/main.ts"
+  }
+}

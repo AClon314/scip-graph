@@ -1,0 +1,12 @@
+node_modules/
+.svelte-kit/
+dist/
+build/
+*.log
+.cache/
+
+# 生成物
+static/*.json
+static/graph.json
+static/*.elk.json
+static/*.force.json
