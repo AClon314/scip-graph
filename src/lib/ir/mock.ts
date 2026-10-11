@@ -531,5 +531,3 @@ const _nodeCheck: GraphNode<MockNodeData> = mockSemanticGraph.nodes[1]!;
 const _edgeCheck: GraphEdge<MockEdgeData> = mockSemanticGraph.edges[0]!;
 void _nodeCheck;
 void _edgeCheck;
-
-console.debug(mockLayeredGraphJson);
