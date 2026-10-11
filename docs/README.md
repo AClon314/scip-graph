@@ -12,6 +12,7 @@
 
 | 文档                                | 内容                                                                 |
 | ----------------------------------- | -------------------------------------------------------------------- |
+| [`scip-symbol-graph-review.md`](scip-symbol-graph-review.md) | 第三方 `scip-symbol-graph` 原型的实测、产品大纲、与我们的对比，以及「取其精华去其糟粕」的分阶段落地路线 |
 | [`query-cli.md`](query-cli.md)      | `bun src/bin/scip-graph.ts` 的 `callers`/`callees`/`impact`/`refs`/`boundaries` 用法、选择器、`--json` 契约、mermaid/dot 导出 |
 | [`query-verification.md`](query-verification.md) | 对真实 `static/graph.json` 跑出的验证记录（精确计数） |
 | [`phase6-acceleration.md`](phase6-acceleration.md) | Phase 6 加速：离线预计算 ELK `stress` 布局（`bun run precompute:elk`）、global 视图 layout 切换、为什么不做 WASM/多线程 |
